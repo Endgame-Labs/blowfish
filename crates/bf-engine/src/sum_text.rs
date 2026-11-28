@@ -185,10 +185,16 @@ pub(crate) fn first_list(k: usize, loose: bool) -> Option<usize> {
 /// The list length that asks for every matching row: the last round before the full scorer.
 pub(crate) const ALL_MATCHES: usize = usize::MAX;
 
+/// The stream length after `MAX_LIST` for a plan with streams: a stream's rows need no column reads
+/// (their values come from the attribute's dictionary), so it can run deeper than the text lists,
+/// which a boost that is flat near its top needs to bound the rows it leaves out.
+pub(crate) const STREAM_LIST: usize = 16384;
+
 /// The next list length after `n`: four times as long up to `MAX_LIST`, then every matching row
 /// (which scores only the rows that match some clause, and needs no bound), then `None`.
-pub(crate) fn next_list(n: usize) -> Option<usize> {
+pub(crate) fn next_list(n: usize, streams: bool) -> Option<usize> {
     match n {
+        MAX_LIST if streams => Some(STREAM_LIST),
         ALL_MATCHES => None,
         n if n * 4 <= MAX_LIST => Some(n * 4),
         _ => Some(ALL_MATCHES),
@@ -230,6 +236,12 @@ pub(crate) enum Expr {
         exponent: f64,
         expr: Box<Expr>,
     },
+    /// `Dist` of a text clause: `|score - origin|`, not monotone, so only the root may be one
+    /// (see `Shape::dist`).
+    Dist {
+        origin: f64,
+        expr: Box<Expr>,
+    },
     /// `Decay`: non-increasing in its child, so only the root may be one (see `Shape::decreasing`).
     Decay {
         midpoint: f64,
@@ -241,10 +253,15 @@ pub(crate) enum Expr {
 /// A term with no BM25 whose value depends on the row (attributes), with a static upper bound.
 pub(crate) struct DocTerm<'a> {
     pub rank: &'a RankBy,
-    /// No row's value exceeds this (as the full scorer computes it).
-    pub upper: f64,
+    /// No row's value exceeds this (as the full scorer computes it); `None` for a term with no
+    /// static bound (a bare attribute), which needs a stream.
+    pub upper: Option<f64>,
     /// Attributes the term reads.
     pub columns: std::collections::BTreeSet<String>,
+    /// The term is a non-decreasing function of this one attribute alone, so a segment can list its
+    /// rows from the largest value down (the attribute's sorted dictionary) as a second source of
+    /// candidates, and bound every row not yet listed by the term at the last value listed.
+    pub stream: Option<String>,
 }
 
 /// A rank the list paths can answer: its expression and the pieces it refers to.
@@ -257,6 +274,9 @@ pub(crate) struct Shape<'a> {
     /// The root is a `Decay` of an expression over text alone: the best rows are the ones that
     /// match least, so the rows that match no text win and the bound-and-list search does not apply.
     pub decreasing: bool,
+    /// The root is `Dist(BM25, origin)`: the winners are the rows farthest from the origin, which
+    /// are the best-scoring rows or the rows that match no text (see `SegmentSum::dist_candidates`).
+    pub dist: Option<f64>,
 }
 
 fn has_text(x: &RankBy) -> bool {
@@ -344,6 +364,33 @@ fn inner_columns(x: &RankBy, columns: &mut std::collections::BTreeSet<String>) -
     }
 }
 
+/// The one attribute a term reads when the term is non-decreasing in that attribute's numeric value
+/// (as `Attribute` reads it: a missing or non-numeric value is 0): constants, `Attribute`,
+/// non-negative constant `Product`s, and `Sum`, `Max`, and `Saturate` of such terms. `None` when the
+/// term reads no attribute, reads two, or is not monotone (`Dist`, `Decay`, a predicate).
+fn monotone_attribute(x: &RankBy) -> Option<String> {
+    fn go(x: &RankBy, attr: &mut Option<String>) -> bool {
+        match x {
+            RankBy::Constant(n) => n.as_f64().is_some_and(f64::is_finite),
+            RankBy::Attribute(name) => match attr {
+                Some(a) => a == name,
+                None => {
+                    *attr = Some(name.clone());
+                    true
+                }
+            },
+            RankBy::Product { weight, expr, .. } => {
+                weight.is_finite() && *weight >= 0.0 && go(expr, attr)
+            }
+            RankBy::Sum(xs) | RankBy::Max(xs) => !xs.is_empty() && xs.iter().all(|x| go(x, attr)),
+            RankBy::Saturate { expr, params } => bounded_params(params).is_some() && go(expr, attr),
+            _ => false,
+        }
+    }
+    let mut attr = None;
+    go(x, &mut attr).then_some(attr).flatten()
+}
+
 struct Build<'a> {
     texts: usize,
     bonuses: Vec<(&'a Filter, Chain)>,
@@ -396,11 +443,18 @@ impl<'a> Build<'a> {
             return Some(Expr::Bonus(self.bonuses.len() - 1));
         }
         let mut columns = Default::default();
-        let upper = upper_of(x, &mut columns)?;
+        let upper = upper_of(x, &mut columns);
+        let stream = monotone_attribute(x);
+        if upper.is_none() {
+            // Without a static bound the term needs a stream, and every row's value must be computable.
+            stream.as_ref()?;
+            columns.extend(stream.clone());
+        }
         self.docs.push(DocTerm {
             rank: x,
             upper,
             columns,
+            stream,
         });
         Some(Expr::Doc(self.docs.len() - 1))
     }
@@ -419,7 +473,22 @@ pub(crate) fn shape_of(rank: Option<&RankBy>) -> Option<Shape<'_>> {
         docs: vec![],
     };
     let mut decreasing = false;
+    let mut dist = None;
     let expr = match rank {
+        RankBy::Dist { expr, origin } => {
+            // Only a plain clause: the other expressions keep the full scorer.
+            let (RankBy::Bm25 { .. }, Some(t)) = (&**expr, origin.as_f64()) else {
+                return None;
+            };
+            if !t.is_finite() {
+                return None;
+            }
+            dist = Some(t);
+            Expr::Dist {
+                origin: t,
+                expr: Box::new(build.expr(expr)?),
+            }
+        }
         RankBy::Decay { expr, params } => {
             let (midpoint, exponent) = bounded_params(params)?;
             let inner = build.expr(expr)?;
@@ -442,6 +511,7 @@ pub(crate) fn shape_of(rank: Option<&RankBy>) -> Option<Shape<'_>> {
         docs: build.docs,
         texts: build.texts,
         decreasing,
+        dist,
     })
 }
 
@@ -453,6 +523,8 @@ pub(crate) struct SumPlan<'a> {
     pub expr: Expr,
     /// See `Shape::decreasing`.
     pub decreasing: bool,
+    /// See `Shape::dist`.
+    pub dist: Option<f64>,
 }
 
 impl SumPlan<'_> {
@@ -473,6 +545,7 @@ impl SumPlan<'_> {
                 Expr::Sum(xs) => xs.iter().map(|x| go(x, t, b, d)).sum(),
                 Expr::Max(xs) => xs.iter().map(|x| go(x, t, b, d)).fold(0.0, f64::max),
                 Expr::Mul(w, x) => w * go(x, t, b, d),
+                Expr::Dist { origin, expr } => (go(expr, t, b, d) - origin).abs(),
                 Expr::Saturate {
                     midpoint,
                     exponent,
@@ -501,15 +574,31 @@ impl SumPlan<'_> {
             match e {
                 Expr::Saturate { .. } => true,
                 Expr::Sum(xs) | Expr::Max(xs) => xs.iter().any(saturates),
-                Expr::Mul(_, x) | Expr::Decay { expr: x, .. } => saturates(x),
+                Expr::Mul(_, x) | Expr::Decay { expr: x, .. } | Expr::Dist { expr: x, .. } => {
+                    saturates(x)
+                }
                 _ => false,
             }
         }
         !self.docs.is_empty() || saturates(&self.expr)
     }
+    /// The largest total of a row that matches no text, in the best bonus class.
+    pub(crate) fn unmatched_bound(&self) -> f64 {
+        let bonus: Vec<f64> = self
+            .bonuses
+            .iter()
+            .map(|b| scaled(&b.weights, 1.0))
+            .collect();
+        let docs: Vec<f64> = self
+            .docs
+            .iter()
+            .map(|d| d.upper.unwrap_or(f64::INFINITY))
+            .collect();
+        self.bound(&vec![0.0; self.clauses.len()], &bonus, &docs)
+    }
     /// The largest total a row can reach when no text clause scores above `cutoffs`.
-    pub(crate) fn bound(&self, cutoffs: &[f32], bonus: &[f64]) -> f64 {
-        self.total(&|i| f64::from(cutoffs[i]), bonus, &|j| self.docs[j].upper)
+    pub(crate) fn bound(&self, cutoffs: &[f32], bonus: &[f64], docs: &[f64]) -> f64 {
+        self.total(&|i| f64::from(cutoffs[i]), bonus, &|j| docs[j])
     }
 }
 
@@ -530,6 +619,8 @@ pub(crate) struct SegmentSum {
     /// Row order is ID order (proven by a validated ID list), needed to pick the lowest-ID rows
     /// among boosted rows that match no text.
     pub id_ordered: bool,
+    /// For each row-wise term with a stream attribute, the attribute's sorted value dictionary here.
+    streams: Vec<Option<Arc<segment::TopValues>>>,
 }
 
 /// Open a segment for `Sum` list searches. `None` when a clause has no usable text index in this
@@ -558,18 +649,47 @@ pub(crate) async fn open(
             .map(|b| segment::filter_live(store, seg, b.filter, &state.schema)),
     );
     let ordered = async {
-        if plan.bonuses.is_empty() && !plan.decreasing {
+        if plan.bonuses.is_empty() && !plan.decreasing && plan.dist.is_none() {
             Ok(false)
         } else {
             segment::ids(store, seg).await.map(|_| true)
         }
     };
-    let (allowed, readers, matches, id_ordered) = tokio::try_join!(
+    let streams = futures::future::try_join_all(plan.docs.iter().map(|d| async move {
+        match &d.stream {
+            // Only numeric attributes: their dictionary is nulls, then numbers in ascending order.
+            Some(attribute)
+                if matches!(
+                    state
+                        .schema
+                        .get(attribute)
+                        .and_then(|a| a.data_type.as_ref()),
+                    Some(AttributeType::Scalar(
+                        ScalarType::Int | ScalarType::Uint | ScalarType::Float
+                    ))
+                ) =>
+            {
+                segment::filter_top(store, seg, attribute).await
+            }
+            _ => Ok(None),
+        }
+    }));
+    let (allowed, readers, matches, id_ordered, streams) = tokio::try_join!(
         snapshot::allowed(store, state, seg, q.filters.as_ref()),
         readers,
         matches,
-        ordered
+        ordered,
+        streams
     )?;
+    // A term with no static bound is only usable with its stream.
+    if plan
+        .docs
+        .iter()
+        .zip(&streams)
+        .any(|(d, s)| d.upper.is_none() && s.is_none())
+    {
+        return Ok(None);
+    }
     let Some(readers) = readers.into_iter().collect::<Option<Vec<_>>>() else {
         return Ok(None);
     };
@@ -600,19 +720,20 @@ pub(crate) async fn open(
         classes,
         readers,
         id_ordered,
+        streams,
     }))
 }
 
 /// A clause's exact scores by row: a map for a short list, a dense array for a long one (the
 /// last round holds every matching row, and hashing each one would cost more than scoring it).
-enum Scores {
+pub(crate) enum Scores {
     Map(HashMap<u32, f32>),
     Dense(Vec<f32>),
 }
 /// Lists longer than this use a dense array.
 const DENSE_AT: usize = 2048;
 impl Scores {
-    fn new(hits: Vec<bf_text::SearchHit>, rows: u32) -> Self {
+    pub(crate) fn new(hits: Vec<bf_text::SearchHit>, rows: u32) -> Self {
         if hits.len() <= DENSE_AT {
             return Scores::Map(hits.into_iter().map(|h| (h.row, h.score)).collect());
         }
@@ -623,7 +744,7 @@ impl Scores {
         Scores::Dense(dense)
     }
     /// The row's score, 0 when it is not in the list.
-    fn get(&self, row: u32) -> f32 {
+    pub(crate) fn get(&self, row: u32) -> f32 {
         match self {
             Scores::Map(m) => m.get(&row).copied().unwrap_or(0.0),
             Scores::Dense(d) => d.get(row as usize).copied().unwrap_or(0.0),
@@ -639,10 +760,99 @@ pub(crate) struct Candidates {
     pub bound: f64,
     /// Every row with a positive score is in `rows`, or loses to `k` rows in it.
     pub exhaustive: bool,
+    /// A row outside `rows` totals strictly less than this, so the `k`th total must reach it
+    /// (`Dist` of text: rows that match a little total just under the zero-score rows).
+    pub at_least: f64,
+}
+
+/// Most dictionary values a stream looks at while it lists rows.
+const MAX_SCAN: usize = 1 << 16;
+
+/// The rows a stream listed, and the term's value bounding every allowed row it did not list
+/// (`None` when it listed them all).
+struct Drawn {
+    /// Each listed row with its attribute value (read from the dictionary, not the column).
+    rows: Vec<(u32, serde_json::Value)>,
+    cut: Option<f64>,
+}
+/// How a draw ended.
+enum Draw {
+    Done(Drawn),
+    /// It looked at `MAX_SCAN` values without finding enough rows.
+    TooLong,
+    /// It ran past the kept top values, and the full dictionary is needed.
+    NeedFull,
+}
+
+/// Lists up to `n` allowed rows from the largest attribute value down, a whole value at a time (the
+/// last one may be split, lowest rows first, and then bounds the rest). `None` when it looked at
+/// `MAX_SCAN` values without finding `n` rows (a selective filter over a large dictionary).
+fn draw(
+    state: &NamespaceState,
+    term: &DocTerm<'_>,
+    values: &[(serde_json::Value, RoaringBitmap)],
+    truncated: bool,
+    allowed: &RoaringBitmap,
+    n: usize,
+) -> Result<Draw, ApiError> {
+    let attribute = term.stream.as_deref().expect("stream attribute");
+    let at = |v: &serde_json::Value| -> Result<f64, ApiError> {
+        let doc = Document::from_iter([(attribute.to_string(), v.clone())]);
+        crate::query::score(state, &doc, term.rank)
+    };
+    // Nulls sort first and read as 0; numbers follow in ascending order.
+    let lo = usize::from(values.first().is_some_and(|(v, _)| v.is_null()));
+    let mut top = values.len();
+    let mut null_pending = lo == 1;
+    let mut rows: Vec<(u32, serde_json::Value)> = vec![];
+    let mut scanned = 0;
+    loop {
+        let next_number = (top > lo).then(|| values[top - 1].0.as_f64().unwrap_or(0.0));
+        let entry = if null_pending && next_number.is_none_or(|x| x < 0.0) {
+            null_pending = false;
+            &values[0]
+        } else if top > lo {
+            top -= 1;
+            &values[top]
+        } else if truncated {
+            return Ok(Draw::NeedFull);
+        } else {
+            return Ok(Draw::Done(Drawn { rows, cut: None }));
+        };
+        scanned += 1;
+        if scanned > MAX_SCAN {
+            return Ok(Draw::TooLong);
+        }
+        let (value, bitmap) = entry;
+        let hits: Vec<u32> = if bitmap.len() <= 256 {
+            bitmap.iter().filter(|r| allowed.contains(*r)).collect()
+        } else {
+            (bitmap & allowed).iter().collect()
+        };
+        if hits.is_empty() {
+            continue;
+        }
+        if rows.len() >= n {
+            return Ok(Draw::Done(Drawn {
+                rows,
+                cut: Some(at(value)?),
+            }));
+        }
+        let room = n - rows.len();
+        if hits.len() > room {
+            rows.extend(hits[..room].iter().map(|r| (*r, value.clone())));
+            return Ok(Draw::Done(Drawn {
+                rows,
+                cut: Some(at(value)?),
+            }));
+        }
+        rows.extend(hits.into_iter().map(|r| (r, value.clone())));
+    }
 }
 
 impl SegmentSum {
-    /// Each clause's best `n` rows per class, then the union scored exactly under every clause.
+    /// Each clause's best `n` rows per class (and, when `streams` is set, each streamed term's best
+    /// `n` rows), then the union scored exactly under every clause.
     /// A class whose bonus is positive also gets `k` fill rows when every list ended short: rows
     /// that match no text still total the bonus, and the lowest IDs among them are the ones that
     /// can win. `None` when that needs an ID order this segment cannot prove.
@@ -652,17 +862,22 @@ impl SegmentSum {
         plan: &SumPlan<'_>,
         n: usize,
         k: usize,
+        streams: bool,
     ) -> Result<Option<Candidates>, ApiError> {
         let mut out = Candidates {
             rows: vec![],
             bound: 0.0,
             exhaustive: true,
+            at_least: 0.0,
         };
         for class in &self.classes {
             let c = if plan.decreasing {
                 self.least_matching(plan, class, k).await?
+            } else if plan.dist.is_some() {
+                self.dist_candidates(plan, class, n, k).await?
             } else {
-                self.class_candidates(state, plan, class, n, k).await?
+                self.class_candidates(state, plan, class, n, k, streams)
+                    .await?
             };
             let Some(c) = c else {
                 return Ok(None);
@@ -670,6 +885,7 @@ impl SegmentSum {
             out.rows.extend(c.rows);
             out.bound = out.bound.max(c.bound);
             out.exhaustive &= c.exhaustive;
+            out.at_least = out.at_least.max(c.at_least);
         }
         Ok(Some(out))
     }
@@ -681,13 +897,17 @@ impl SegmentSum {
         class: &Class,
         n: usize,
         k: usize,
+        streams: bool,
     ) -> Result<Option<Candidates>, ApiError> {
         let clauses = &plan.clauses;
+        let all_matches = n == ALL_MATCHES;
+        // Streams may run deeper than the text lists (see `STREAM_LIST`).
+        let stream_n = n;
         // One more than the rows there are, so no list is ever full and none needs a bound.
         let n = if n == ALL_MATCHES {
             class.rows.len() as usize + 1
         } else {
-            n
+            n.min(MAX_LIST)
         };
         let mut union = RoaringBitmap::new();
         let mut cutoffs = Vec::with_capacity(clauses.len());
@@ -716,7 +936,63 @@ impl SegmentSum {
             }
             lists.push((full, hits));
         }
-        let bound = plan.bound(&cutoffs, &class.bonus);
+        // Row-wise terms with a stream list their own best `n` rows, and bound the rest by the
+        // term at the last value listed.
+        let mut doc_bounds: Vec<f64> = plan
+            .docs
+            .iter()
+            .map(|d| d.upper.unwrap_or(f64::INFINITY))
+            .collect();
+        let mut covered = false;
+        let mut known: Vec<HashMap<u32, serde_json::Value>> = vec![HashMap::new(); plan.docs.len()];
+        for (j, doc) in plan.docs.iter().enumerate() {
+            let Some(values) = &self.streams[j] else {
+                continue;
+            };
+            // A term with a static bound streams only after a round without it failed to decide:
+            // most queries are decided by the lists alone, and the stream rows add work.
+            if !streams && doc.upper.is_some() {
+                continue;
+            }
+            let drawn = if all_matches {
+                None
+            } else {
+                match draw(
+                    state,
+                    doc,
+                    &values.values,
+                    values.truncated,
+                    &class.rows,
+                    stream_n,
+                )? {
+                    Draw::Done(d) => Some(d),
+                    Draw::TooLong => None,
+                    // The allowed rows hold none of the largest values (a selective filter):
+                    // a stream would have to decode the whole dictionary, which costs more
+                    // than the rows it could save.
+                    Draw::NeedFull => None,
+                }
+            };
+            let Some(drawn) = drawn else {
+                // No usable stream: the static bound must do, and a bare attribute has none.
+                if doc.upper.is_none() {
+                    return Ok(None);
+                }
+                continue;
+            };
+            match drawn.cut {
+                Some(cut) => doc_bounds[j] = doc_bounds[j].min(cut),
+                None => covered = true,
+            }
+            union.extend(drawn.rows.iter().map(|(row, _)| *row));
+            known[j].extend(drawn.rows);
+        }
+        // A stream that listed every allowed row leaves nothing outside the union.
+        let bound = if covered {
+            f64::NEG_INFINITY
+        } else {
+            plan.bound(&cutoffs, &class.bonus, &doc_bounds)
+        };
         // Row-wise terms give rows that match no text a total of their own (not one shared value),
         // so only the bound can prove that nothing outside the lists wins.
         let exhaustive = plan.docs.is_empty() && lists.iter().all(|(full, _)| !full);
@@ -738,7 +1014,7 @@ impl SegmentSum {
                 .map_err(segment::index_error)?;
             exact.push(Scores::new(all, reader.num_docs()));
         }
-        let docs = self.row_terms(state, plan, &union).await?;
+        let docs = self.row_terms(state, plan, &union, &known).await?;
         let mut rows: Vec<(u32, f64)> = union
             .iter()
             .map(|row| {
@@ -769,6 +1045,81 @@ impl SegmentSum {
             rows,
             bound,
             exhaustive,
+            at_least: 0.0,
+        }))
+    }
+
+    /// `Dist(BM25, t)`: a row's total is `|score - t|`, which is largest at the best scores or at
+    /// no score at all. Takes the best `n` rows, and (when `t` is not 0) the `k` lowest-ID rows that
+    /// match no text, which all total `|t|`. A row outside both has a score in `(0, c]`, where `c` is
+    /// the list's last score, so it totals at most `|c - t|`, and strictly less than `|t|` when that
+    /// is the larger; the caller accepts when the `k`th total beats the first and reaches the second.
+    async fn dist_candidates(
+        &self,
+        plan: &SumPlan<'_>,
+        class: &Class,
+        n: usize,
+        k: usize,
+    ) -> Result<Option<Candidates>, ApiError> {
+        let t = plan.dist.expect("dist plan");
+        let (clause, reader) = (&plan.clauses[0], &self.readers[0]);
+        let n = if n == ALL_MATCHES {
+            class.rows.len() as usize + 1
+        } else {
+            n
+        };
+        let hits = reader
+            .search_prefetched(
+                &clause.query,
+                clause.stats,
+                &clause.cfg,
+                n,
+                Some(&class.rows),
+            )
+            .await
+            .map_err(segment::index_error)?;
+        let full = hits.len() >= n;
+        let cutoff = if full { hits[n - 1].score } else { 0.0 };
+        let mut rows: Vec<(u32, f64)> = hits
+            .iter()
+            .map(|h| (h.row, (f64::from(h.score) - t).abs()))
+            .collect();
+        if t != 0.0 {
+            if !self.id_ordered {
+                return Ok(None);
+            }
+            // The `k` lowest-ID allowed rows that score 0: score a window of the lowest rows and
+            // grow it until `k` of them match nothing (or it holds every allowed row).
+            let mut w = (k * 4).max(MIN_LIST);
+            loop {
+                let window: RoaringBitmap = class.rows.iter().take(w).collect();
+                let scored = reader
+                    .search_prefetched(
+                        &clause.query,
+                        clause.stats,
+                        &clause.cfg,
+                        window.len() as usize,
+                        Some(&window),
+                    )
+                    .await
+                    .map_err(segment::index_error)?;
+                let matched: RoaringBitmap = scored.iter().map(|h| h.row).collect();
+                let zeros: Vec<u32> = (&window - &matched).iter().take(k).collect();
+                if zeros.len() >= k || window.len() == class.rows.len() {
+                    rows.extend(zeros.into_iter().map(|row| (row, t.abs())));
+                    break;
+                }
+                w *= 4;
+                if w > MAX_WINDOW {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(Candidates {
+            rows,
+            bound: (f64::from(cutoff) - t).abs(),
+            exhaustive: !full,
+            at_least: if full { t.abs() } else { 0.0 },
         }))
     }
 
@@ -828,6 +1179,7 @@ impl SegmentSum {
                     rows,
                     bound: 0.0,
                     exhaustive: true,
+                    at_least: 0.0,
                 }));
             }
             w *= 4;
@@ -838,11 +1190,14 @@ impl SegmentSum {
     }
 
     /// Each row's row-wise terms, evaluated exactly as the full scorer would on the row's document.
+    /// `known[j]` holds the attribute value of term `j` for rows a stream listed (read from the
+    /// dictionary), so a row whose every term is known needs no column read.
     async fn row_terms(
         &self,
         state: &NamespaceState,
         plan: &SumPlan<'_>,
         rows: &RoaringBitmap,
+        known: &[HashMap<u32, serde_json::Value>],
     ) -> Result<HashMap<u32, Vec<f64>>, ApiError> {
         if plan.docs.is_empty() || rows.is_empty() {
             return Ok(HashMap::new());
@@ -852,14 +1207,29 @@ impl SegmentSum {
             .iter()
             .flat_map(|d| d.columns.iter().cloned())
             .collect();
-        let docs = segment::projected_rows(&self.store, &self.seg, rows, Some(&columns)).await?;
-        let mut out = HashMap::with_capacity(docs.len());
+        let unread: RoaringBitmap = rows
+            .iter()
+            .filter(|row| known.iter().any(|k| !k.contains_key(row)))
+            .collect();
+        let docs = segment::projected_rows(&self.store, &self.seg, &unread, Some(&columns)).await?;
+        let mut out = HashMap::with_capacity(rows.len() as usize);
         for row in rows {
-            let doc = docs.get(&row).ok_or_else(segment::corrupt)?;
             let values = plan
                 .docs
                 .iter()
-                .map(|d| crate::query::score(state, doc, d.rank))
+                .enumerate()
+                .map(|(j, d)| match known[j].get(&row) {
+                    // A streamed term reads one attribute, and the dictionary holds its value.
+                    Some(v) => {
+                        let attribute = d.stream.as_deref().expect("stream attribute");
+                        let doc = Document::from_iter([(attribute.to_string(), v.clone())]);
+                        crate::query::score(state, &doc, d.rank)
+                    }
+                    _ => {
+                        let doc = docs.get(&row).ok_or_else(segment::corrupt)?;
+                        crate::query::score(state, doc, d.rank)
+                    }
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             out.insert(row, values);
         }
@@ -902,8 +1272,15 @@ impl SegmentSum {
 
 /// Decide a round: the winners' score floor, or `None` when the lists were too short to prove it.
 /// `totals` holds every candidate total (segment unions and tail documents), `bound` the largest
-/// per-segment outside bound, and `exhaustive` whether every list ended short.
-pub(crate) fn accept(totals: &mut [f64], k: usize, bound: f64, exhaustive: bool) -> Option<f64> {
+/// per-segment outside bound, `at_least` the total every outside row stays strictly below, and
+/// `exhaustive` whether every list ended short.
+pub(crate) fn accept(
+    totals: &mut [f64],
+    k: usize,
+    bound: f64,
+    at_least: f64,
+    exhaustive: bool,
+) -> Option<f64> {
     let positive = |t: &f64| *t > 0.0;
     let count = totals.iter().filter(|t| positive(t)).count();
     if count < k {
@@ -913,7 +1290,17 @@ pub(crate) fn accept(totals: &mut [f64], k: usize, bound: f64, exhaustive: bool)
     let kth = *totals
         .select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a))
         .1;
-    (exhaustive || kth > bound).then_some(kth)
+    (exhaustive || (kth > bound && kth >= at_least)).then_some(kth)
+}
+
+/// The `k`th largest positive total, or `None` when fewer than `k` totals are positive.
+pub(crate) fn kth_total(totals: &mut [f64], k: usize) -> Option<f64> {
+    let count = totals.iter().filter(|t| **t > 0.0).count();
+    (count >= k && k > 0).then(|| {
+        *totals
+            .select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a))
+            .1
+    })
 }
 
 #[cfg(test)]
@@ -923,14 +1310,14 @@ mod tests {
     #[test]
     fn accepts_only_a_kth_total_strictly_above_the_bound() {
         // Strictly above: accepted, and the floor is the kth total.
-        assert_eq!(accept(&mut [9.0, 7.0, 5.0], 2, 6.5, false), Some(7.0));
+        assert_eq!(accept(&mut [9.0, 7.0, 5.0], 2, 6.5, 0.0, false), Some(7.0));
         // A tie with the bound could hide an outside row that wins on ID: not proven.
-        assert_eq!(accept(&mut [9.0, 7.0, 5.0], 2, 7.0, false), None);
+        assert_eq!(accept(&mut [9.0, 7.0, 5.0], 2, 7.0, 0.0, false), None);
         // Fewer than k positive rows: only complete lists prove nothing is missing.
-        assert_eq!(accept(&mut [9.0, 0.0], 2, 3.0, false), None);
-        assert_eq!(accept(&mut [9.0, 0.0], 2, 0.0, true), Some(0.0));
+        assert_eq!(accept(&mut [9.0, 0.0], 2, 3.0, 0.0, false), None);
+        assert_eq!(accept(&mut [9.0, 0.0], 2, 0.0, 0.0, true), Some(0.0));
         // Complete lists need no bound at all.
-        assert_eq!(accept(&mut [2.0, 1.0], 1, 0.0, true), Some(2.0));
+        assert_eq!(accept(&mut [2.0, 1.0], 1, 0.0, 0.0, true), Some(2.0));
     }
     #[test]
     fn weights_nest_innermost_first_and_zero_or_extreme_weights_are_refused() {
@@ -990,11 +1377,26 @@ mod tests {
             Some((1, 0, 1, false))
         );
         assert_eq!(shape(serde_json::json!(["Sum", [bm(), -1.0]])), None);
-        // An attribute on its own is unbounded.
+        // An attribute on its own has no static bound but streams (it is monotone in one attribute).
         assert_eq!(
             shape(serde_json::json!([
                 "Sum",
                 [bm(), ["Max", [["Attribute", "n"], 0]]]
+            ])),
+            Some((1, 0, 1, false))
+        );
+        // Two attributes, or a decreasing term without a bound, have neither.
+        assert_eq!(
+            shape(serde_json::json!([
+                "Sum",
+                [bm(), ["Sum", [["Attribute", "n"], ["Attribute", "m"]]]]
+            ])),
+            None
+        );
+        assert_eq!(
+            shape(serde_json::json!([
+                "Sum",
+                [bm(), ["Dist", ["Attribute", "n"], 3]]
             ])),
             None
         );
@@ -1020,7 +1422,19 @@ mod tests {
             shape(serde_json::json!(["Decay", ["Sum", [bm(), pred(1)]], {}])),
             None
         );
-        assert_eq!(shape(serde_json::json!(["Dist", bm(), 5.0])), None);
+        // `Dist` of a plain clause only, at the root.
+        assert_eq!(
+            shape(serde_json::json!(["Dist", bm(), 5.0])),
+            Some((1, 0, 0, false))
+        );
+        assert_eq!(
+            shape(serde_json::json!(["Dist", ["Sum", [bm(), bm()]], 5.0])),
+            None
+        );
+        assert_eq!(
+            shape(serde_json::json!(["Sum", [["Dist", bm(), 5.0], bm()]])),
+            None
+        );
         // No text at all is not a text rank.
         assert_eq!(shape(serde_json::json!(["Sum", [1.0, 2.0]])), None);
     }
@@ -1057,9 +1471,11 @@ mod tests {
         assert_eq!(first_list(100, false), Some(100));
         assert_eq!(first_list(1000, true), Some(1000));
         assert_eq!(first_list(4097, false), None);
-        assert_eq!(next_list(64), Some(256));
-        assert_eq!(next_list(1024), Some(4096));
-        assert_eq!(next_list(4096), Some(ALL_MATCHES));
-        assert_eq!(next_list(ALL_MATCHES), None);
+        assert_eq!(next_list(64, false), Some(256));
+        assert_eq!(next_list(1024, false), Some(4096));
+        assert_eq!(next_list(4096, true), Some(STREAM_LIST));
+        assert_eq!(next_list(STREAM_LIST, true), Some(ALL_MATCHES));
+        assert_eq!(next_list(4096, false), Some(ALL_MATCHES));
+        assert_eq!(next_list(ALL_MATCHES, false), None);
     }
 }

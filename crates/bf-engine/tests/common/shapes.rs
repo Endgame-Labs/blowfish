@@ -161,6 +161,23 @@ pub fn shapes(a: &str, b: &str) -> Vec<(&'static str, Value)> {
             json!(["Decay", ["Sum", [ca, cb]], {"midpoint": 6}]),
         ),
         ("dist of text", json!(["Dist", ca, 5.0])),
+        ("dist at zero", json!(["Dist", ca, 0])),
+        ("dist small", json!(["Dist", ca, 0.5])),
+        ("dist huge", json!(["Dist", ca, 1000])),
+        ("dist negative", json!(["Dist", ca, -2.0])),
+        ("bare attribute", json!(["Sum", [ca, ["Attribute", "n"]]])),
+        (
+            "weighted bare attribute",
+            json!(["Sum", [ca, ["Product", 0.5, ["Attribute", "n"]]]]),
+        ),
+        (
+            "bare float guarded by max",
+            json!(["Sum", [ca, ["Max", [["Attribute", "pop"], 0]]]]),
+        ),
+        (
+            "bare attribute and popularity and clause",
+            json!(["Sum", [ca, ["Attribute", "n"], popularity(3.0), cb]]),
+        ),
     ]
 }
 pub async fn compare(e: &Engine, tag: &str, sets: &[(&str, &str)]) {
@@ -184,7 +201,8 @@ pub async fn corpus(e: &Engine, f: fn(u64) -> String) {
     write(
         e,
         json!({"schema":{"text":{"type":"string","full_text_search":true},
-            "pop":{"type":"float"},"ts":{"type":"datetime"}},
+            "pop":{"type":"float","filterable":true},"ts":{"type":"datetime"},
+            "n":{"type":"uint","filterable":true}},
             "upsert_rows": batch_with(0..500, f)}),
     )
     .await;
@@ -192,8 +210,27 @@ pub async fn corpus(e: &Engine, f: fn(u64) -> String) {
     write(e, json!({"upsert_rows": batch_with(500..900, f)})).await;
     e.index_namespace("t", true).await.unwrap();
 }
+/// `limit.per` and the shapes no list can bound take the ordinal scorer; hold it to full scoring.
+pub async fn compare_per(e: &Engine, tag: &str, sets: &[(&str, &str)]) {
+    for (a, b) in sets {
+        for (name, rank) in shapes(a, b) {
+            for (total, per, offset) in [(10, 1, 0), (10, 2, 3), (30, 3, 0), (5, 1, 4)] {
+                let q = json!({"rank_by": rank, "limit": {"total": total,
+                    "per": {"attributes": ["n"], "limit": per}}, "offset": offset,
+                    "include_attributes": ["n"]});
+                identical(
+                    e,
+                    q,
+                    &format!("{tag} per {name} {a}|{b} {total}/{per}+{offset}"),
+                )
+                .await;
+            }
+        }
+    }
+}
 pub async fn run(e: &Engine, sets: &[(&str, &str)], f: fn(u64) -> String) {
     compare(e, "segments", sets).await;
+    compare_per(e, "segments", sets).await;
     write(
         e,
         json!({
@@ -205,6 +242,8 @@ pub async fn run(e: &Engine, sets: &[(&str, &str)], f: fn(u64) -> String) {
     )
     .await;
     compare(e, "tail", sets).await;
+    compare_per(e, "tail", sets).await;
     e.index_namespace("t", true).await.unwrap();
     compare(e, "reindexed", sets).await;
+    compare_per(e, "reindexed", sets).await;
 }

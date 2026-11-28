@@ -18525,3 +18525,79 @@ the cold-S3 gain from the dictionary-read count is untested; the first query per
 
 No other text query changes: BM25, phrase, and the exact-term paths do not touch the new list, and the reader gains one empty
 `OnceLock` and a mutex until a boolean token query runs.
+
+
+## Round BW28: scalar streams, `Dist(BM25)` from both ends, and an ordinal scorer for what is left
+
+After BW26, four shapes still scored and hydrated every allowed row (2.0 to 2.7 s on 1M MS MARCO, and up to 13.8 GB at 16 clients): a
+scalar boost that dominates the text, a bare `Attribute` in a `Sum`, `Dist(BM25, t)`, and plain BM25 with `limit.per`.
+
+### What changed
+
+1. **A second candidate source: scalar streams** (`sum_text.rs`, `segment::filter_top`). A row-wise term that is non-decreasing in
+   one numeric attribute (`Attribute`, a non-negative constant `Product`, `Sum`, `Max`, and `Saturate` of it) lists its best rows
+   from the attribute's sorted dictionary (`filter.bfx`, so the attribute must be `filterable`), a whole value at a time. A row
+   outside every list has each text clause at most its cutoff and the term at most its value at the last row the stream listed, so
+   the same strict test (`kth > bound`) proves the answer. A bare `Attribute` has no static bound and is accepted only with its
+   stream, so `Sum(BM25, Attribute(uint))` and `Sum(BM25, Max(Attribute(float), 0))` are list shapes now. Details that matter:
+   - A stream runs only after the plain lists failed to decide (a term with a static bound is mostly decided without it, and its
+     rows add work), except for a term with no static bound, which streams from the first round.
+   - The stream rows' values come from the dictionary, so their attribute is never read from the column.
+   - Each segment keeps the largest 32,768 values per streamed attribute in a small process-wide map. Admitting a million-value
+     dictionary to the shared decoded cache evicted the text and column blocks other queries share (the first version doubled the
+     popularity shape's latency that way).
+   - After the 4,096-row round, a stream-only round lists 16,384 rows while the text lists stay at 4,096: a boost that is flat near
+     its top (`200 * Saturate(pop)`) cannot be bounded by 4,096 rows, and a stream row costs no column read.
+   - A selective filter that leaves none of the top values allowed makes the stream give up (no stream, never a dictionary decode).
+   - The last round that scores every matching row is skipped for a streamed plan unless the `k`th total already found beats the
+     bound for rows that match no text, because it cannot prove a dominating boost.
+2. **`Dist(BM25, t)`** (`SegmentSum::dist_candidates`): `|score - t|` is largest at the best scores or at no score. Each segment
+   returns the best `n` rows, and (for `t != 0`) the `k` lowest-ID allowed rows that score 0, found by scoring a window of the
+   lowest rows and growing it, as `Decay` does. A row outside both has a score in `(0, c]` (`c` the list's last score), so it totals
+   at most `|c - t|` and strictly less than `|t|`; the answer is accepted when the `k`th total beats the first and reaches the second
+   (`Candidates::at_least`). A first version found the zero-score rows from `contains_any_token`, which also matches rows whose
+   tokens are all stop words (they score 0 and are not in the BM25 hits); it missed lowest-ID rows, and the 100-query comparison caught it.
+3. **An ordinal scorer for the all-rows path** (`ordinal_scan.rs`). A rank built from BM25 clauses, constants, and numeric attributes
+   no longer hydrates every allowed row: each clause's hits are already in hand, the columns the expression and `limit.per` read are
+   projected 32,768 rows at a time, `query::arithmetic` (the full scorer's own arithmetic, now shared) scores each row in parallel,
+   and a bounded heap keeps the best `k + offset` rows (or the best `per.limit` rows of each group). Only those rows are hydrated.
+   Plain BM25 and the other ranks that score 0 without a match look at the matching rows only. This is also what the streamed plans
+   fall back to when no bound proves them.
+
+### Measurement
+
+Fixture: a fresh load of the first 1M MS MARCO passages with `pop` (float, 0 to 1,000, `1000 * u^4`), `ts`, `cat` (`id % 8`), and
+`pr` (uint, 0 to 100), all `filterable`, 13 text segments. One server at a time on this VM (6 Rayon workers), a Python driver, 100
+queries per shape (the checked-in MS MARCO queries cycling six pages: `top_k` 10 unfiltered, `id >= 200000`, `id < 50000`, offsets 7
+and 20, and `top_k` 100). The baseline is the v0.1.76 release build (`753589a`) and recorded the truth; the candidate matched it
+**exactly** on every query of every shape (ordered IDs and `f64` scores, compared as parsed JSON). The VM carried a load of 4 to 14
+from other workers, so differences under about 30 percent are noise. The baseline ran at 1 and 2 clients only (it used 3.3 to 3.7 GB
+at 2 clients); the candidate at 1 client and at 16 clients (median of 3 passes).
+
+| Shape | v0.1.76 1 client p50 / p90 ms | v0.1.76 2 clients q/s | candidate 1 client p50 / p90 ms | gain at 1 client (p50) | candidate 16 clients q/s (p50 / p90 ms) | gain at 16 vs 2 clients | peak RSS at 16 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `Sum(BM25, 200*Saturate(pop, 300))` (dominating boost) | 2,442 / 2,866 | 0.82 | 15.9 / 28.9 | 154x | 85 (181 / 218) | 104x | 1.6 GB |
+| `Sum(BM25, Attribute(pr))` (bare) | 2,027 / 2,496 | 0.99 | 12.4 / 25.9 | 163x | 97 (160 / 191) | 98x | 1.5 GB |
+| `Sum(BM25, 0.5*Attribute(pr))` | 2,020 / 2,313 | 1.03 | 9.7 / 23.7 | 208x | 124 (124 / 155) | 120x | 1.5 GB |
+| `Dist(BM25, 10)` | 2,374 / 2,790 | 1.02 | 3.5 / 6.7 | 678x | 450 (23 / 45) | 441x | 1.2 GB |
+| BM25 with `limit.per` (`cat`, 2 per group) | 2,142 / 3,134 | 0.94 | 131 / 188 | 16x | 12.4 (1,234 / 1,490) | 13x | 1.8 GB |
+
+The all-rows shapes used 3.3 to 3.7 GB at 2 clients on the baseline (13.8 GB at 16 clients in BW26); the candidate's peak is **1.8 GB**
+at 16 clients. `limit.per` is CPU bound on the group column read of every matching row (a bound on the groups cannot prune it).
+
+No other shape is slower (1 client p50 ms, v0.1.76 then candidate; this VM was busy, so single numbers move by a few ms):
+plain BM25 7.6 and 5.9, `Sum(BM25, Saturate(pop, 100))` 11.2 and 9.0, recency boost 8.7 and 4.1, `Sum` of two `Saturate` clauses 8.3 and 5.6.
+At 16 clients the candidate runs those at 581, 277, 278, and 308 q/s (plain, popularity, recency, `Sum` of two `Saturate`).
+
+### Tests
+
+`tests/rank_shapes.rs` now also holds `Dist` at 0, 0.5, 5, 1,000, and -2, a bare `Attribute` (plain, weighted, and under `Max`), a bare
+attribute with a popularity boost and two clauses, and every shape again under `limit.per` (four page shapes), against
+`query_exhaustive` (full scoring, scores included), over a tie-heavy corpus and a varied one, two segments, a WAL tail, and a reindex.
+`tests/rank_shapes_lists.rs` asserts the new shapes are decided from lists with no fallback. `sum_text` unit tests cover the shape rules.
+
+### Not done
+
+Cold reads, EC2, and a 16-client baseline (it passes 3 GB at 2 clients) were not measured. The ordinal scorer still reads the group
+column of every matching row for `limit.per`, so that shape is 13 to 16 times faster, not hundreds. A stream needs a `filterable`
+numeric attribute; without it a bare `Attribute` takes the ordinal scorer (about 100 to 150 ms on this fixture).

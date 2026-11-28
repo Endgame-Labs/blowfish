@@ -1830,6 +1830,96 @@ pub(crate) async fn filter_live(
 }
 
 /// Evaluate scalar, array, range, and boolean filters over sorted value dictionaries.
+/// A filterable attribute's sorted value dictionary: each distinct value with the rows holding it,
+/// optionally without keeping a freshly decoded one in the general cache.
+/// A big dictionary (a million distinct values) is tens of megabytes decoded, and admitting it
+/// evicts the text and column blocks that queries share.
+async fn filter_dictionary(
+    store: &Storage,
+    segment: &Segment,
+    attribute: &str,
+    keep: bool,
+) -> Result<Option<Arc<Vec<(Value, RoaringBitmap)>>>, ApiError> {
+    let Some(file) = segment.files.get("filters") else {
+        return Ok(None);
+    };
+    let reader = ObjectReader::new(store, file);
+    let dir = directory(&reader).await?;
+    match dir.columns.get(attribute) {
+        Some(col) => dictionary(&reader, col, attribute, keep).await.map(Some),
+        None => Ok(None),
+    }
+}
+/// The largest values of a filterable attribute with their rows, for streams that list rows from the
+/// top. `values` keeps the dictionary's layout (a null entry first, then numbers ascending) but only
+/// the last `TOP_VALUES` numbers, so a large dictionary does not have to stay decoded in memory.
+pub(crate) struct TopValues {
+    pub values: Vec<(Value, RoaringBitmap)>,
+    /// Smaller numbers exist beyond `values`.
+    pub truncated: bool,
+}
+/// Numbers kept per attribute and segment by [`filter_top`].
+const TOP_VALUES: usize = 1 << 15;
+/// [`TopValues`] of an attribute, kept in a small process-wide map. `None` when the segment has no
+/// filter column for it.
+pub(crate) async fn filter_top(
+    store: &Storage,
+    segment: &Segment,
+    attribute: &str,
+) -> Result<Option<Arc<TopValues>>, ApiError> {
+    let Some(file) = segment.files.get("filters") else {
+        return Ok(None);
+    };
+    // Object keys name immutable bytes, so entries never go stale. The slices are small, and a
+    // process-wide map keeps them out of the shared cache's eviction churn.
+    static TOP: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, Arc<TopValues>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let key = format!("{}:{attribute}", file.key);
+    if let Some(top) = TOP.lock().expect("top values lock").get(&key) {
+        return Ok(Some(top.clone()));
+    }
+    let Some(full) = filter_dictionary(store, segment, attribute, false).await? else {
+        return Ok(None);
+    };
+    let nulls = usize::from(full.first().is_some_and(|(v, _)| v.is_null()));
+    let from = full.len().saturating_sub(TOP_VALUES).max(nulls);
+    let mut values: Vec<(Value, RoaringBitmap)> = full[..nulls].to_vec();
+    values.extend(full[from..].iter().cloned());
+    let top = Arc::new(TopValues {
+        values,
+        truncated: from > nulls,
+    });
+    let mut map = TOP.lock().expect("top values lock");
+    if map.len() >= 4096 {
+        map.clear();
+    }
+    map.insert(key, top.clone());
+    Ok(Some(top))
+}
+async fn dictionary(
+    reader: &ObjectReader,
+    col: &Column,
+    attribute: &str,
+    keep: bool,
+) -> Result<Arc<Vec<(Value, RoaringBitmap)>>, ApiError> {
+    let key = format!("{}:{attribute}", reader.file.key);
+    if let Some(values) = read_cache::get(&key, col.blocks[0].length) {
+        return Ok(values);
+    }
+    let bytes = read_block(reader, &col.blocks[0]).await?;
+    // Keep reads concurrent, and bound only their CPU-heavy dictionary
+    // decodes. Busy queries perform their own work without a handoff.
+    let value = crate::ann_dir::on_worker(async move { decode(&bytes) }).await?;
+    if !keep {
+        return Ok(Arc::new(value));
+    }
+    Ok(read_cache::insert(
+        &key,
+        col.blocks[0].length.saturating_mul(32),
+        value,
+    ))
+}
 pub(crate) fn filter_rows<'a>(
     store: &'a Storage,
     segment: &'a Segment,
@@ -1942,18 +2032,7 @@ pub(crate) fn filter_rows<'a>(
                     }
                     return Ok(out);
                 };
-                let key = format!("{}:{attribute}", reader.file.key);
-                let values: Arc<Vec<(Value, RoaringBitmap)>> = if let Some(values) =
-                    read_cache::get(&key, col.blocks[0].length)
-                {
-                    values
-                } else {
-                    let bytes = read_block(&reader, &col.blocks[0]).await?;
-                    // Keep reads concurrent, and bound only their CPU-heavy dictionary
-                    // decodes. Busy queries perform their own work without a handoff.
-                    let value = crate::ann_dir::on_worker(async move { decode(&bytes) }).await?;
-                    read_cache::insert(&key, col.blocks[0].length.saturating_mul(32), value)
-                };
+                let values = dictionary(&reader, col, attribute, true).await?;
                 let mut out = RoaringBitmap::new();
                 // Sorted dictionary runs permit binary seeks for scalar ranges.
                 // Canonicalization preserves datetime, UUID, and exact integer ordering.

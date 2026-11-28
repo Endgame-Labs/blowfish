@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.78] - 2026-11-27
+
+### Changed
+
+- **The last BM25 rank shapes that scored every row now take list paths, or an ordinal scorer:** A scalar boost that dominates the text (`Sum(BM25, 200 * Saturate(Attribute(pop)))`), a bare `Attribute` in a `Sum`, and `Dist(BM25, t)` took 2.0 to 2.7 s on a million passages. A boost on a `filterable` numeric attribute now lists its best rows from the attribute's sorted values as a second source of candidates, and `Dist` takes the best scores and the lowest-ID rows that match nothing, under the same strict bound, so they take 3.5 to 16 ms at one client (154 to 678 times faster, 98 to 441 times at 16 clients). Plain BM25 with `limit.per` and the other all-rows ranks score rows by ordinal and hydrate only the winners: 16 times faster at one client, and peak memory at 16 clients is 1.8 GB instead of 13.8 GB. Results are identical to the full scorer (IDs and scores).
+
 ## [0.1.77] - 2026-11-27
 
 ### Changed
@@ -559,7 +565,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.77...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.78...HEAD
+[0.1.78]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.78
 [0.1.77]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.77
 [0.1.76]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.76
 [0.1.75]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.75
