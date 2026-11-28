@@ -860,9 +860,12 @@ const GROUP_PROBES: usize = 12;
 /// chose them) make one slab, or several when they hold more than `max` rows. `None` once
 /// `stopping` says so (checked between cells and rows).
 /// Leaves each row is compared with in the second assignment: its leaf's nearest neighbors, by
-/// the refined centers. Rows move to leaves near their old one (on BEIR NQ, 32 neighbors give
-/// recall@10 within 0.0003 of a full second assignment, at a ninth of its time).
-const REASSIGN_NEIGHBORS: usize = 32;
+/// the refined centers. Rows move to leaves near their old one, so on BEIR NQ 80 neighbors keep
+/// recall@10 within 0.0003 of a full second assignment at about a fifth of its time. A full pass
+/// also evens out leaf sizes a little more (the row-weighted mean leaf size, which sets how many
+/// rows a query scans, is 2 percent larger here), and each doubling of this count closes less of
+/// that gap for more time.
+const REASSIGN_NEIGHBORS: usize = 80;
 
 /// For each leaf, the `k` leaves whose centers are nearest to it (itself first), looked for among
 /// the leaves of its `NEAR_CELLS` nearest coarse cells.
@@ -1419,8 +1422,8 @@ fn assign_leaves(
     // One refinement: recompute every leaf center from its rows, and assign again. The second
     // assignment compares a row with its leaf's nearest leaves only, since a refined center moves
     // little and a row changes leaf to a nearby one. (Stopping at the recomputed centers, without
-    // it, cost 0.002 to 0.003 of recall@10 on NQ; a full second assignment cost nine times the
-    // time for 0.0003.)
+    // it, cost 0.002 to 0.003 of recall@10 on NQ; a full second assignment costs five times the
+    // time of this one, for 0.0003.)
     {
         let refinement = Stage::new("refine_centers");
         let mut members: Vec<Vec<u32>> = vec![Vec::new(); leaves.len()];
@@ -1460,6 +1463,35 @@ fn assign_leaves(
             "recluster: refined at {:.0}s",
             t0.elapsed().as_secs_f64()
         );
+    }
+    {
+        // Leaf size spread, to see what a pass does to query scan cost: the row-weighted mean leaf
+        // size is the expected size of the leaf a random row sits in.
+        let mut counts = vec![0u64; leaves.len()];
+        for l in &leaf_of {
+            counts[*l as usize] += 1;
+        }
+        let total: u64 = counts.iter().sum();
+        let weighted = counts.iter().map(|n| n * n).sum::<u64>() as f64 / total.max(1) as f64;
+        counts.sort_unstable();
+        let at = |q: f64| counts[((counts.len() as f64 * q) as usize).min(counts.len() - 1)];
+        tracing::info!(
+            leaves = counts.len(),
+            empty = counts.iter().filter(|n| **n == 0).count(),
+            p50 = at(0.5),
+            p99 = at(0.99),
+            max = counts[counts.len() - 1],
+            row_weighted_mean = weighted,
+            "recluster: leaf sizes"
+        );
+        if std::env::var_os("BF_TRACE_STAGES").is_some() {
+            eprintln!(
+                "RR9 leaf_sizes p50={} p99={} max={} row_weighted_mean={weighted:.2}",
+                at(0.5),
+                at(0.99),
+                counts[counts.len() - 1]
+            );
+        }
     }
     // Each cell's leaves, with the rows that chose them, in ascending row order.
     let cell_of: Vec<usize> = ranges

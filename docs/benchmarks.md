@@ -12296,6 +12296,80 @@ The instance is terminated, and independent checks found zero owned active
 instances, volumes, security groups, key pairs, S3 objects, and multipart uploads.
 Shared fixtures were untouched.
 
+## Round RR9: the second assignment pass scores each leaf's rows against its nearest leaves
+
+Recluster assigns every row to a leaf, recomputes each leaf's center from its rows, and assigns every row again. RR7 put 96.7 of
+179.5 s in those two passes. Measured 2026-11-28 on one on-demand c7gd.2xlarge (RR7's setup: eight Graviton3 cores, 16 GiB, local
+NVMe, four recluster and Rayon workers, release thin LTO, Clang 19 and a Clang 22 linker), on a fresh untiered NQ checkpoint
+(2,681,468 rows, 1,024-d f16 cosine, 32 slabs, 13,392 leaves) built with `examples/rr7_prepare.rs` and copied for every arm. Install
+time runs from the foreground recluster call through fenced publication (the `rr7_install` clock). Recall@10 is
+`rr7_quality`: all 3,452 NQ queries against exact truth, top-k 10, rerank factor 32, concurrency 4, explicit probes, fresh engine.
+The control is v0.1.84 (commit `6e33e87`); both binaries carry the same quality and timing test code.
+
+### Measure first
+
+| Arm | Install s | Second pass s | Recall@10, 48 / 64 probes |
+| --- | ---: | ---: | ---: |
+| Control, two full passes | 164.4 | 46.5 (ordering 12.2, scoring 34.3), plus 3.0 refine | 0.95070 / 0.96089 |
+| One pass, centers never refined | 114.6 | 0 | 0.94760 / 0.95944 (-0.0031 / -0.0014) |
+| One pass, refined centers over first-pass membership | 117.8 | 0 | 0.94887 / 0.95907 (-0.0018 / -0.0018) |
+| Second pass for only the 30% of leaves whose centers move most | 122.8 | 5.7 | 0.94765 / 0.95889 (-0.0030 / -0.0020) |
+
+The first pass takes 50.3 s. In the full second pass **457,389 rows (17.06%) change leaf.** They are not concentrated in the leaves
+whose centers drift most (Sol 09:25 #3's selector): the top 20% of leaves by drift hold 5.8% of the rows and 4.4% of the movers,
+because tiny leaves drift most, and the top 50% hold 27.9% of the rows and 24.7% of the movers. Limiting the pass by drift therefore
+saves little and loses recall. Skipping the pass costs 0.0031 at 48 probes, just over the 0.003 stop bar, but the stop rule did not
+need a second key: movers go to a leaf near their old one, so the pass can stay and look only there.
+
+### The option built
+
+After refining all centers, each leaf gets a list of its 80 nearest leaves by refined center, among the leaves of its four nearest
+coarse cells. A leaf's rows are then scored together against that one list (the rows of a leaf share it, so its centers stay in
+cache), and each row takes the nearest. No format change, no setting, and no second routing key: the first-pass membership is
+only a starting point. The code is `leaf_neighbors` and `reassign_nearby` in `recluster.rs`; the dead RR4 drift diagnostic and the
+second full pass are removed.
+
+Neighbor count, install-only runs (second pass seconds include 1.4 s of neighbor lists):
+
+| Neighbors | Install s | Second pass s | Moved rows | Row-weighted mean leaf size |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 (first-pass membership) | 122.1 | 0 | 0 | 289.4 |
+| 32 | 122.3 to 124.2 | 5.3 to 5.5 | 332,093 (12.4%) | 275.6 |
+| 64 | 126.2 to 126.4 | 7.7 | 366,079 (13.7%) | 273.4 |
+| 80 | 127.4 to 128.6 | about 8.5 | n/a | 272.9 |
+| 96 | 128.8 to 130.8 | about 10 | n/a | 272.5 |
+| 128 | 132.3 | 13.0 | n/a | 271.9 |
+| 256 | 141.0 | 21.6 | n/a | 270.8 |
+| Control, full second pass | 162.1 to 164.4 | 46.5 | 457,389 (17.1%) | 267.4 |
+
+The row-weighted mean leaf size is the expected size of the leaf a row sits in, so it sets how many rows a query scans. The full
+pass evens sizes out a little more than any neighbor count does (it is also free to send a nearly-tied row to a distant leaf).
+At 32 neighbors a first paired run showed cold p50 about 4% slower, which matched the 3% larger leaves; 80 neighbors cost
+about 3.7 s more and brought latency back to the control's within run-to-run noise (about 2%).
+
+### Paired result (80 neighbors, same host, interleaved)
+
+| Run | Install s | Recall@10, 48 / 64 | Cold p50 / p90 ms, 48 probes | Warm p50 / p90 ms, 48 | Cold p50 / p90 ms, 64 | Warm p50 / p90 ms, 64 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Control A | 162.13 | 0.95070 / 0.96089 | 9.24 / 10.87 | 3.85 / 4.30 | 10.35 / 11.93 | 4.41 / 4.88 |
+| Control B | 162.12 | same | 8.97 / 10.52 | 3.81 / 4.27 | 10.03 / 11.63 | 4.37 / 4.79 |
+| Control C | 164.30 | same | 9.06 / 10.66 | 3.94 / 4.39 | 10.07 / 11.70 | 4.67 / 5.11 |
+| 80 neighbors A | 127.36 | 0.95043 / 0.96060 | 9.02 / 10.55 | 3.87 / 4.32 | 10.10 / 11.74 | 4.42 / 4.86 |
+| 80 neighbors B | 128.64 | same | 9.07 / 10.68 | 3.90 / 4.35 | 10.14 / 11.76 | 4.50 / 4.94 |
+
+Means: install **162.85 s to 128.00 s, 1.272x** (pass: 1.25x). Recall@10 **-0.00026 at 48 probes and -0.00029 at 64** (pass:
+within 0.002; both runs of each arm are deterministic and identical). Query latency, 80 neighbors against the control means: cold
+p50 -0.5% and -0.3% (48 and 64 probes), warm p50 +0.4% and -0.5%, cold p90 -0.6% and 0.0%, warm p90 +0.1% and -0.1%, all inside
+the 3% bar. Latency is a replay at concurrency 4 on local files on one host, so cold means a fresh engine, not empty OS caches.
+The 32-neighbor and 64/96-neighbor arms above are from the same box and binary family, and are a sweep, not the shipped setting.
+
+The measured binaries read the neighbor count from a test-only environment variable and log the leaf-size line; the shipped code
+fixes it at 80 and is otherwise the same algorithm. A bit-for-bit comparison with the control is not possible (this changes
+membership by design): 12 to 13% of rows sit in a different leaf than the control's.
+
+Cost: one c7gd.2xlarge for about 1.7 hours, about $0.6 at RR4's historical $0.3629 per hour, below the $6 cap. The instance, key
+pair, and security group are deleted; the round wrote nothing to the bucket (NQ inputs were copied from the read-only fixture).
+
 ## Round C18: fit the 10M exact vectors with lossless exponent packing
 
 The current-format 10M tier requires **22,095,496,715 bytes** for its complete
