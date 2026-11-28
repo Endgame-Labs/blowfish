@@ -2,6 +2,10 @@
 
 Newest first. Each entry says what works now and how it was checked.
 
+## 2026-11-28
+
+- **v0.1.81: G26 merged.** The warm graph's paired recall check accepted the lowest effort on the sign of a 128-query mean (interval about plus or minus 0.022), so on BEIR NQ the graph served recall@10 of 0.943 to 0.949 against IVF's 0.961, below decision 29's requirement. A trial is now accepted only on a positive lower bound or a full 512-query window: the graph settles at `ef` 125, recall 0.965, about 18,400 q/s at `top_k` 10 on the M4, and promotion takes about 19 minutes instead of 2. The graph also serves `top_k` plus `offset` up to 256 (4.4 to 7.9 times IVF at higher recall).
+
 ## 2026-11-27
 
 - **v0.1.80: BW29 merged.** BM25 with `limit.per` groups rows by each segment's integer codes for low-cardinality columns instead of building a JSON key per candidate (4.3 to 5 times faster, warm and cold), and `ContainsAllTokens` and `ContainsTokenSequence` filters start from the first token's postings instead of a bitmap over every row (2 to 2.5 times and 1.6 times with BM25). Identical results. A filter fused into the BM25 search was slower and was not kept.
