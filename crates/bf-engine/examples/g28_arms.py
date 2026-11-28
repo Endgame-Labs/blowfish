@@ -5,7 +5,8 @@
 
 Usage: g28_arms.py RUN_DIR PID OUT.jsonl SECONDS PORT 'ARM|ARM|...' CASE [CASE ...]
 RUN_DIR holds fixture/data (queries.npy, truth*.npy, filters.json, filters10.json) and the switch file the
-server reads (BF_G28_SWITCH=RUN_DIR/switch). A CASE is a filter name from filters.json (a filtered query,
+server reads (BF_G28_SWITCH=RUN_DIR/switch; Round G28 ran a build with a temporary switch that is not in the
+tree, so an arm names whatever such a build looks for). A CASE is a filter name from filters.json (a filtered query,
 `top_k` 10) or `kN` (an unfiltered query at `top_k` N, checked against truth.npy). For each case the arms run
 in order (repeat the list to alternate); each runs the native driver (16 connections) for SECONDS after a
 serial quality pass over ROWS queries (default 1,000), and the line records q/s, p50, p99, recall@10, server CPU

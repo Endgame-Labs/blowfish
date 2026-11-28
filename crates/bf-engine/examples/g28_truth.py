@@ -1,13 +1,13 @@
 # /// script
 # dependencies = ["numpy==2.5.4"]
 # ///
-"""Round G28 (from g27_truth.py): more filtered NQ workloads (10 percent) (id-range filters) and their exact top-10 truth.
+"""Round G28 (from g27_truth.py): two more filtered NQ workloads (10 percent: `id-10` and `sc-10`) and their exact top-10 truth.
 
-Usage: uv run g27_truth.py DATA_DIR OUT_DIR [QUERIES]
+Usage: uv run g28_truth.py DATA_DIR OUT_DIR [QUERIES]
 DATA_DIR holds corpus.f16 and queries.npy. The NQ fixture has only `id` and `vector`, so the
 filters are on `id`: `id-P` is the prefix `id < P percent`, and `sc-P` is an Or of id ranges
 placed at random on a grid (the rows allowed are scattered over the id space). Writes
-OUT_DIR/truth-CASE.npy (int32, QUERIES x 10) and OUT_DIR/filters.json (CASE -> filter).
+OUT_DIR/truth-CASE.npy (int32, QUERIES x 10) and OUT_DIR/filters10.json (CASE -> filter).
 """
 import json
 import math
