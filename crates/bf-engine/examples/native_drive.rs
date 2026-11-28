@@ -3,6 +3,8 @@
 //!
 //! Usage: `native_drive DATA PORT bf|qdrant K SECONDS [EF] [OUT_JSON] [SERVER_PID]`
 //!
+//! `NATIVE_DRIVE_FILTER` adds a JSON `filters` clause to every request and `NATIVE_DRIVE_ROWS` keeps the first N queries.
+//!
 //! `DATA` holds `queries.npy` (`<f4`) and `truth.npy` (`<i4`; `NATIVE_DRIVE_TRUTH` names another file, `NATIVE_DRIVE_OFFSET` pages). It opens 16 persistent keep-alive
 //! connections (one thread each), encodes every request body before the clock starts (floats
 //! written as the shortest `f64` text of the `f32` value, the same digits as Python's `tolist()`),
@@ -154,14 +156,19 @@ fn process_cpu(pid: u32) -> f64 {
             .fold(0.0, |acc, p| acc * 60.0 + p.parse::<f64>().unwrap())
 }
 
-fn encode(engine: &str, k: usize, ef: u64, offset: usize, q: &[f32]) -> Vec<u8> {
+fn encode(engine: &str, k: usize, ef: u64, offset: usize, filter: &str, q: &[f32]) -> Vec<u8> {
     let vector = q
         .iter()
         .map(|x| serde_json::to_string(&f64::from(*x)).unwrap())
         .collect::<Vec<_>>()
         .join(",");
     if engine == "bf" {
-        format!(r#"{{"rank_by":["vector","ANN",[{vector}]],"top_k":{k},"offset":{offset},"include_attributes":false}}"#)
+        let filters = if filter.is_empty() {
+            String::new()
+        } else {
+            format!(r#""filters":{filter},"#)
+        };
+        format!(r#"{{"rank_by":["vector","ANN",[{vector}]],{filters}"top_k":{k},"offset":{offset},"include_attributes":false}}"#)
     } else {
         format!(r#"{{"vector":[{vector}],"limit":{k},"with_payload":false,"with_vector":false,"params":{{"hnsw_ef":{ef}}}}}"#)
     }
@@ -185,8 +192,14 @@ fn main() {
     // NATIVE_DRIVE_OFFSET pages: the request skips this many rows, and recall is of ranks
     // OFFSET..OFFSET+K against the truth file's columns (which must be at least that wide).
     let offset: usize = std::env::var("NATIVE_DRIVE_OFFSET").map_or(0, |s| s.parse().unwrap());
+    // NATIVE_DRIVE_FILTER is a JSON filter sent with every request (the truth file must be the
+    // exact answer under it), and NATIVE_DRIVE_ROWS keeps only the first queries.
+    let filter = std::env::var("NATIVE_DRIVE_FILTER").unwrap_or_default();
     let (shape, raw) = npy(&format!("{data}/queries.npy"), "<f4");
-    let (rows, dims) = (shape[0], shape[1]);
+    let (mut rows, dims) = (shape[0], shape[1]);
+    if let Ok(n) = std::env::var("NATIVE_DRIVE_ROWS") {
+        rows = rows.min(n.parse().unwrap());
+    }
     let queries: Vec<f32> = raw
         .as_chunks::<4>()
         .0
@@ -214,7 +227,16 @@ fn main() {
     };
     let bodies: Arc<Vec<Vec<u8>>> = Arc::new(
         (0..rows)
-            .map(|i| encode(&engine, k, ef, offset, &queries[i * dims..(i + 1) * dims]))
+            .map(|i| {
+                encode(
+                    &engine,
+                    k,
+                    ef,
+                    offset,
+                    &filter,
+                    &queries[i * dims..(i + 1) * dims],
+                )
+            })
             .collect(),
     );
 

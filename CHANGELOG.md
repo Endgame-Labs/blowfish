@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.84] - 2026-11-28
+
+### Changed
+
+- **Broadly filtered vector queries are 2.4 to 2.7 times faster on a warm graph:** A filter that keeps more than one row in eight used to send the query to IVF. The warm graph now walks once with a beam widened for the filter, applies the filter to the exact-scored candidates, and falls back to IVF only if fewer than `top_k` survive. On BEIR NQ (2.7M rows) on the M4, a 50 percent filter rises from 1,135 to 3,095 queries per second and a 20 percent filter from 508 to 1,226, at recall above IVF's. Narrower filters keep the graph's filtered scan. See Round G27 in `docs/benchmarks.md`.
+
 ## [0.1.83] - 2026-11-28
 
 ### Changed
@@ -606,7 +612,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.83...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.84...HEAD
+[0.1.84]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.84
 [0.1.83]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.83
 [0.1.82]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.82
 [0.1.81]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.81

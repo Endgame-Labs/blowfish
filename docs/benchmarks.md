@@ -19529,3 +19529,62 @@ times). "Cold" here is a fresh process on local disk, not S3. Local only (no EC2
 two- and three-attribute tuples (including repeated and reordered attributes), a plain attribute in the tuple (column fallback), a tuple
 space of 84,300 (the map), and `bounded_group_search_widens_until_every_group_is_full` (3,600 rows, a group that scores below the first 512
 rows, a group that never matches, ties, deletes, and offsets).
+
+## Round G27: filters wider than 1 in 8 are answered by the warm graph's widened walk, 2.4 to 2.7 times IVF's rate at higher recall
+
+**Setup:** the Apple M4 (shared Mac mini, 10 cores, 16 GB), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine), the frozen v0.1.19 fixture, release binaries, indexing off, the graph promoted the ordinary way (`g15_promote.py`, 800 q/s of heat; `ef` 100 on the first two servers), the native driver (`native_drive`, 16 connections, 10 seconds per arm after a serial pass over 1,000 queries), `top_k` 10, IDs only. Recall@10 is against the exact filtered top 10 over the stored f16 values (`g27_truth.py`). The driver gained `NATIVE_DRIVE_FILTER` and `NATIVE_DRIVE_ROWS`; `g27_arms.py` runs arms on one promoted server.
+
+**Filters.** The frozen fixture has only `id` and `vector`, so there is **no hash (`bucket`) column**, and rebuilding it needs a full reload. The filters are on `id`: `id-P` is `id < P percent` (a contiguous prefix), and `sc-P` is an Or of id ranges placed at random (`sc-50` is 10 ranges of 5 percent, `sc-20` is 4, `sc-5` is 5 of 1 percent, and `sc-1` is 5 of 0.2 percent). The `sc` masks cost about 17 ms of CPU to build whichever path serves them, which hides the path's own cost, so the pass test uses the `id` cases.
+
+### 1. Today (v0.1.81): what serves a filter
+
+Above 1 in 8 of the rows (`SCAN_SHARE`), IVF answers (graph answers: 0). At or below it, the graph's one-bit code scan answers. There is no masked navigation for filters (the graph's walk takes a mask only for shadowed rows).
+
+| Case | Serving path | q/s | p50 ms | Recall@10 | Server CPU per query |
+|---|---|---:|---:|---:|---:|
+| id-50 | IVF | 1,135 | 13.5 | 0.9831 | 8.1 ms |
+| id-20 | IVF | 508 | 31.0 | 0.9943 | 17.7 ms |
+| id-5 | scan | 2,675 | 5.6 | 1.0000 | 3.4 ms |
+| id-1 | scan | 5,500 | 2.7 | 1.0000 | 1.65 ms |
+| sc-50 | IVF | 530 | 30.0 | 0.9819 | 17.6 ms |
+| sc-20 | IVF | 498 | 31.7 | 0.9963 | 18.1 ms |
+| sc-5 | scan | 1,296 | 12.3 | 0.9999 | 7.2 ms |
+| sc-1 | scan | 855 | 18.8 | 1.0000 | 11.0 ms |
+
+### 2. The post-filter walk
+
+The unfiltered walk with a beam of `C * k / p` (`p` the allowed share, at least the calibrated `ef`), the filter applied to the beam, the survivors exactly reranked, and today's path when fewer than `k` survive. Temporary switch file (not in the tree). q/s and recall@10 (the same server for each pair; two servers):
+
+| Case | Today | C 10 | C 20 | C 40 | C 60 | C 80 |
+|---|---|---|---|---|---|---|
+| id-50 | 1,128 / 0.9831 | 5,806 / 0.9721 | 6,376 / 0.9819 | 4,823 / 0.9892 | 3,921 / 0.9913 | 3,089 / 0.9930 |
+| id-20 | 512 / 0.9943 | 6,096 / 0.9827 | 4,141 / 0.9881 | 2,302 / 0.9925 | 1,683 / 0.9935 | 1,228 / 0.9949 |
+
+A longer exact-rerank shortlist (60 and 100 instead of 30) changed nothing: the beam bounds recall. **C 80 is the first setting at or above IVF's recall on both**, so it ships. The beam is capped at 8,192 and `top_k` is limited to 10, the size measured.
+
+**Narrow filters stay on the scan.** At 5 and 1 percent the walk lost: id-5 2,326 q/s at recall 0.9916 (C 20) and 1,122 at 0.9946 (C 50) against the scan's 2,652 at 1.0000; id-1 2,229 at 0.9769 and 1,119 at 0.9837 against 5,498 at 1.0000. So the walk applies only above the scan's 1-in-8 share, and the 5 and 1 percent filters run the unchanged path.
+
+### 3. Shipped (C 80, a third server, `ef` 100)
+
+| Case | Before q/s (recall, CPU per query) | After q/s (recall, CPU per query) | Ratio |
+|---|---|---|---:|
+| id-50 | 1,135 (0.9831, 8.1 ms) | **3,095** (**0.9939**, 2.96 ms) | **2.7x** |
+| id-20 | 508 (0.9943, 17.7 ms) | **1,226** (**0.9953**, 7.4 ms) | **2.4x** |
+| id-5 | 2,675 (1.0000) | 2,764 (1.0000) | same path |
+| id-1 | 5,500 (1.0000) | 5,596 (1.0000) | same path |
+| sc-20 | 498 (0.9963) | 1,178 (0.9967) | 2.4x |
+| sc-5 | 1,296 (0.9999) | 1,300 (0.9999) | same path |
+| sc-50 | 530 (0.9819) | 546 (0.9938) | 1.03x (the Or mask costs 17 ms, in front of either path) |
+
+Pass: at least 1.3x at recall at least today's on the 50 and 20 percent filters: **met** (2.7x and 2.4x, recall higher on both); nothing slower at 5 and 1 percent: **met** (unchanged path, within noise). **The fallback never ran:** every query was answered by the graph (graph answers equal requests), because a beam of 80 `k / p` leaves hundreds of survivors at any share above 1 in 8. When fewer than `k` survive, the walk returns nothing and IVF answers, which costs one walk (about 1.5 to 3 ms of CPU at these shares).
+
+### 4. G26's loose end: why one `top_k` 100 pass ran at IVF's rate
+
+**Not reproduced; cause not found.** On a promoted single server (`ef` 100), a `top_k` 10 pass (19,947 q/s) was followed by 5 minutes idle, a `top_k` 100 pass (11,294 q/s, p50 1.2 ms), 2 minutes more, and another (11,091 q/s). Status polled every 5 seconds through 25 minutes of holding (two servers' timelines) showed `usable` true every time, and the server log had no demotion, retirement, or decline lines. So a quiet gap and a `top_k` 100 pass do not demote the graph. The candidate I could not exclude: G26 ran two servers at once on the 16 GB M4 (a promotion calibrating beside the measured server), and `trim()` evicts the lowest-benefit graph when builds plus foreground caches pass four fifths of the memory limit. I did not run two servers.
+
+### 5. Notes
+
+- Filters other than `id` ranges (a hash column) were not measured; the `id` prefixes are a contiguous range of NQ's insertion order, which may correlate with the vector space more than a hash would.
+- Promotion took 37 minutes from start here (graph ready at 15, `ef` 100 accepted after rejecting 64 and 80), about the 19 G26 reported plus the 10-minute dwell.
+- The fixture went to the M4 without each segment's `ann.1.bfa` and the WAL data (about 12.6 GB the tiers do not read); the server started and served normally.
+- Cost: about 27 GB of S3 transfer to this VM and 6 GB to the M4 (about $3). The M4 run directory is deleted.

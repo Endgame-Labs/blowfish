@@ -314,8 +314,14 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
             }
         }
     }
+    // Round G27: a filter wider than 1 in 8 is answered by the walk once the graph is usable.
+    let wide =
+        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":10,"filters":["group","Eq",1]});
+    same_rows(
+        query(&e, "hot", wide.clone()).await,
+        query(&control, "hot", wide).await,
+    );
     for body in [
-        json!({"rank_by":["vector","ANN",vectors[17]],"top_k":10,"filters":["group","Eq",1]}),
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":257}),
         json!({"rank_by":["vector","ANN",vectors[17]],"top_k":1,"offset":256}),
         json!({"rank_by":["vector","ANN",vec![0.;16]],"top_k":10}),
@@ -956,6 +962,24 @@ async fn selective_filters_scan_the_graph_and_match_the_ivf_control() {
         query(&control, "hot", ask(7, wide, 10)).await,
     );
     assert_eq!(answers(), before);
+    // Round G27: once the graph is calibrated, the same wide filter is answered by the unfiltered
+    // walk with the filter applied to its beam. This graph is small enough that the widened beam
+    // covers every row, so the answer equals the control's. A filter above 1 in 8 that leaves
+    // fewer than `k` rows in the beam (here: none) falls back to IVF.
+    held.calibration.lock().unwrap().usable = true;
+    for (filter, k, walked) in [
+        (json!(["bucket", "Lt", 20]), 10, true),
+        (json!(["bucket", "Lt", 50]), 10, true),
+        (json!(["bucket", "Lt", 20]), 11, false),
+    ] {
+        let before = answers();
+        same_rows(
+            query(&e, "hot", ask(7, filter.clone(), k)).await,
+            query(&control, "hot", ask(7, filter, k)).await,
+        );
+        assert_eq!(answers() > before, walked, "k={k}");
+    }
+    held.calibration.lock().unwrap().usable = false;
     // Rows rewritten, moved to another bucket, and deleted since the tier was built are shadowed:
     // the scan must not return their old versions.
     let moved = vector();
@@ -1846,4 +1870,22 @@ async fn typed_ids_path_serves_a_staged_engine_byte_identically() {
         drop(held);
         assert!(e.shutdown(Duration::from_secs(5)).await);
     }
+}
+
+// Round G27: the post-filter walk's beam widens with the filter's narrowness and leaves narrow
+// filters to the code scan.
+#[test]
+fn walk_beam_widens_with_the_filter_and_leaves_narrow_filters_to_the_scan() {
+    let rows = 1_000_000;
+    // Narrower than 1 in 8 (and exactly 1 in 8): the scan answers.
+    assert_eq!(walk_beam(10, 125_000, rows, 100), None);
+    assert_eq!(walk_beam(10, 50_000, rows, 100), None);
+    // 50 percent: 80 * 10 / 0.5; 20 percent: 80 * 10 / 0.2.
+    assert_eq!(walk_beam(10, 500_000, rows, 100), Some(1_600));
+    assert_eq!(walk_beam(10, 200_000, rows, 100), Some(4_000));
+    // Everything allowed still uses at least the calibrated beam.
+    assert_eq!(walk_beam(1, 1_000_000, rows, 100), Some(100));
+    // Larger pages and empty requests are not measured.
+    assert_eq!(walk_beam(11, 500_000, rows, 100), None);
+    assert_eq!(walk_beam(0, 500_000, rows, 100), None);
 }
