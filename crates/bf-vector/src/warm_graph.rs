@@ -551,6 +551,78 @@ mod tests {
         assert!(graph.scan(query, 0, usize::MAX, &all, true).is_err());
     }
     #[test]
+    fn filtered_walk_returns_only_allowed_rows_in_order_and_matches_the_scan_on_a_small_graph() {
+        let (dims, n) = (16, 400);
+        let mut seed = 9u64;
+        let source = (0..n)
+            .map(|_| {
+                (0..dims)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        (seed >> 40) as f32 / 16777216. * 2. - 1.
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut b = HotGraphBuilder::new(dims, n).unwrap();
+        let row = |i: usize| ((i * 7) % n) as u32 + 5;
+        let ids = (0..n).map(row).collect::<Vec<_>>();
+        let packed = source
+            .iter()
+            .flatten()
+            .flat_map(|x| f16::from_f32(*x).to_le_bytes())
+            .collect::<Vec<_>>();
+        b.append(&ids, &packed, &|| false).unwrap();
+        let graph = b.finish(&|| false).unwrap();
+        let mut scratch = graph.scratch();
+        // A tenth of the rows, scattered; and the rows with an even number.
+        let tenth = (0..n)
+            .map(row)
+            .filter(|r| r % 10 == 3)
+            .collect::<RoaringBitmap>();
+        let even = (0..n)
+            .map(row)
+            .filter(|r| r % 2 == 0)
+            .collect::<RoaringBitmap>();
+        for allowed in [&tenth, &even] {
+            for q in [3, 41, 200, 399] {
+                let (hits, evaluations) = graph
+                    .filtered_walk(&source[q], 64, 10, allowed, 4, 4, usize::MAX, &mut scratch)
+                    .unwrap()
+                    .expect("an uncapped walk finds ten rows");
+                assert_eq!(hits.len(), 10);
+                assert!(hits.iter().all(|(r, _)| allowed.contains(*r)));
+                assert!(evaluations > 0 && evaluations <= n);
+                // The same nodes as an exhaustive scan, in the same order, on this small graph
+                // (the walk's frontier reaches every node here).
+                let (scanned, _) = graph
+                    .scan(&source[q], 10, usize::MAX, allowed, false)
+                    .unwrap();
+                let walked = hits.iter().map(|h| h.0).collect::<Vec<_>>();
+                let truth = scanned.iter().map(|h| h.0).collect::<Vec<_>>();
+                let shared = walked.iter().filter(|r| truth.contains(r)).count();
+                assert!(shared >= 9, "walk and scan share {shared} of 10 rows");
+            }
+        }
+        // A cap that ends the walk before it finds `count` rows is a decline, not a short answer.
+        assert!(
+            graph
+                .filtered_walk(&source[3], 64, 10, &tenth, 4, 1, 3, &mut scratch)
+                .unwrap()
+                .is_none()
+        );
+        // Nothing allowed.
+        let none = RoaringBitmap::from_iter([0, 1]);
+        assert!(
+            graph
+                .filtered_walk(&source[3], 64, 10, &none, 1, 1, usize::MAX, &mut scratch)
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
     fn one_bit_screen_keeps_the_nearest_rows_and_the_exact_shortlist_size() {
         let (dims, n) = (256, 3000);
         let mut seed = 17u64;

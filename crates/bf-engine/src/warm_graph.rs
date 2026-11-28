@@ -183,6 +183,12 @@ impl Reservation {
             .ok()
             .map(|_| Self(bytes))
     }
+    /// Charge `bytes` that are already allocated, even if that passes the cap (the next admission
+    /// then sees the overcommit and trims).
+    fn force(bytes: u64) -> Self {
+        RESERVED.fetch_add(bytes, Ordering::AcqRel);
+        Self(bytes)
+    }
     fn shrink(&mut self, bytes: u64) {
         if bytes < self.0 {
             RESERVED.fetch_sub(self.0 - bytes, Ordering::AcqRel);
@@ -334,6 +340,8 @@ struct Entry {
     /// queries hydrate IDs from the documents.
     ids: std::sync::OnceLock<IdTable>,
     ids_started: std::sync::atomic::AtomicBool,
+    /// The bytes of a string ID table beyond the 16 a row the graph's reservation already holds.
+    ids_extra: std::sync::OnceLock<Reservation>,
 }
 struct Heat {
     first: Instant,
@@ -1099,6 +1107,7 @@ impl Engine {
             searches: AtomicU64::new(0),
             ids: std::sync::OnceLock::new(),
             ids_started: std::sync::atomic::AtomicBool::new(false),
+            ids_extra: std::sync::OnceLock::new(),
             pending_cost: Mutex::default(),
         }))
     }
@@ -1936,6 +1945,12 @@ async fn build_id_table(
     } else {
         IdTable::Uint(uints)
     };
+    let extra = table
+        .resident_bytes()
+        .saturating_sub(total as u64 * IdTable::MAX_ROW_BYTES);
+    if extra > 0 {
+        let _ = entry.ids_extra.set(Reservation::force(extra));
+    }
     let _ = entry.ids.set(table);
 }
 /// Run a calibration ANN plan through the same CPU dispatch as an ordinary warm query.

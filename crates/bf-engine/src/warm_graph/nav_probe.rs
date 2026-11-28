@@ -239,6 +239,7 @@ async fn same_graph_navigation_cpu() {
         pending_cost: Mutex::default(),
         ids: std::sync::OnceLock::new(),
         ids_started: std::sync::atomic::AtomicBool::new(false),
+        ids_extra: std::sync::OnceLock::new(),
     });
     let key = Key::new("nq", &state, "vector", set);
     let mut heat = Heat::new(Instant::now());
