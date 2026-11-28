@@ -9,6 +9,7 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 ### Changed
 
 - **Cold BM25 is 1.26 times faster on object storage:** A cold search's first posting read now covers every window whose score bound is at least 0.3 of the segment's best (at least 24 windows, capped at about 4 MiB) instead of a fixed 24, so most queries no longer wait for a second, refining read; that read stays as the exact fallback. On a million MS MARCO passages on S3, cold p50 falls from 144 to 114 ms and p90 from 174 to 136 ms, with 40 percent fewer GETs, 3 percent more bytes, and identical results. Warm searches are unchanged. See Round C42 in `docs/benchmarks.md`.
+- **BM25 with `limit.per` is 4 to 6 times cheaper again:** `limit.per` over several scalar columns now groups by a tuple of each segment's integer codes instead of building a JSON key per candidate (about 5 times faster on two columns), and `limit.per` over a single BM25 clause runs a top-K search that widens until every group holds its rows above the cut, instead of scoring every match (4 to 6 times less CPU). Identical results, ties and offsets included. See Round BW30 in `docs/benchmarks.md`.
 
 ## [0.1.82] - 2026-11-28
 

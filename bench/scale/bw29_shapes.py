@@ -45,8 +45,8 @@ def build(queries, n):
             b["limit"] = limit
         return b
 
-    def per(count):
-        return {"total": 10, "per": {"attributes": ["cat"], "limit": count}}
+    def per(count, attributes=("cat",)):
+        return {"total": 10, "per": {"attributes": list(attributes), "limit": count}}
 
     def slices(make, pool):
         usable = [make(x) for x in pool]
@@ -90,6 +90,9 @@ def build(queries, n):
         "seqc+bm25": slices(fixed("ContainsTokenSequence", phrases, 1), indexed),
         "per1": slices(lambda t: req(["text", "BM25", t], limit=per(1)), texts),
         "per3": slices(lambda t: req(["text", "BM25", t], limit=per(3)), texts),
+        # Round BW30: two columns (8 x 5 = 40 groups).
+        "per2c1": slices(lambda t: req(["text", "BM25", t], limit=per(1, ("cat", "cat2"))), texts),
+        "per2c3": slices(lambda t: req(["text", "BM25", t], limit=per(3, ("cat", "cat2"))), texts),
     }
     return out
 

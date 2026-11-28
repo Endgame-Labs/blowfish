@@ -14,6 +14,7 @@ use roaring::RoaringBitmap;
 use std::{
     cmp::Ordering,
     collections::{BTreeSet, BinaryHeap, HashMap},
+    sync::Arc,
 };
 
 /// Rows scored per projected chunk: bounds the documents alive at once.
@@ -114,6 +115,152 @@ fn score_row(
     .ok_or_else(|| ApiError::bad("expected a score expression"))
 }
 
+/// The group codes of every `limit.per` attribute, combined into one integer tuple per row.
+struct TupleCodes {
+    columns: Vec<Arc<segment::GroupCodes>>,
+    /// Each column's multiplier in the tuple: the product of the later columns' group counts.
+    strides: Vec<u32>,
+    /// The number of possible tuples.
+    space: u32,
+}
+/// Tuple spaces up to this size index a table of heaps directly; larger ones use a map.
+const DENSE_TUPLES: u32 = 1 << 16;
+impl TupleCodes {
+    fn dense(&self) -> bool {
+        self.space <= DENSE_TUPLES
+    }
+    fn tuple(&self, row: u32) -> u32 {
+        self.columns
+            .iter()
+            .zip(&self.strides)
+            .map(|(c, s)| u32::from(c.codes[row as usize]) * s)
+            .sum()
+    }
+}
+/// [`TupleCodes`] for the attributes, or `None` when one has no codes here or the tuple space does
+/// not fit a `u32` (the column path then builds JSON keys).
+async fn tuple_codes(
+    store: &Storage,
+    state: &NamespaceState,
+    seg: &bf_wal::Segment,
+    attributes: &[String],
+    rows: usize,
+) -> Result<Option<TupleCodes>, ApiError> {
+    let mut columns = Vec::new();
+    for attribute in attributes {
+        match segment::group_codes(store, seg, &state.schema, attribute, rows).await? {
+            Some(c) => columns.push(c),
+            None => return Ok(None),
+        }
+    }
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    let mut strides = vec![0; columns.len()];
+    let mut space = 1u32;
+    for (i, c) in columns.iter().enumerate().rev() {
+        strides[i] = space;
+        let Some(next) = space.checked_mul(c.groups as u32) else {
+            return Ok(None);
+        };
+        space = next;
+    }
+    Ok(Some(TupleCodes {
+        columns,
+        strides,
+        space,
+    }))
+}
+
+/// A `limit.per` over one BM25 clause whose groups all have integer codes: the segment's contenders
+/// then come from a bounded top-K search that widens until every group is full, instead of scoring
+/// every matching row.
+pub(crate) struct GroupedSearch {
+    codes: TupleCodes,
+    per: usize,
+}
+/// Rows the first bounded search asks for; each widening multiplies it by [`WIDEN`].
+const FIRST_K: usize = 512;
+const WIDEN: usize = 4;
+impl GroupedSearch {
+    /// The plan for this query and segment, or `None` when the exhaustive scorer must run: the
+    /// rank is not one plain BM25 clause, there is no `limit.per`, or a group has no integer code
+    /// (or the tuple space is too big for a direct table).
+    pub(crate) async fn plan(
+        store: &Storage,
+        state: &NamespaceState,
+        q: &QueryRequest,
+        seg: &bf_wal::Segment,
+        clauses: &[&RankBy],
+    ) -> Result<Option<Self>, ApiError> {
+        let (Some(per), Some(rank)) = (q.limit.as_ref().and_then(Limit::per), q.rank_by.as_ref())
+        else {
+            return Ok(None);
+        };
+        if per.limit == 0 || clauses.len() != 1 || !matches!(rank, RankBy::Bm25 { .. }) {
+            return Ok(None);
+        }
+        let rows = segment::ids(store, seg).await?.len();
+        Ok(tuple_codes(store, state, seg, &per.attributes, rows)
+            .await?
+            .filter(TupleCodes::dense)
+            .map(|codes| Self {
+                codes,
+                per: per.limit,
+            }))
+    }
+
+    /// Every hit `select` needs from `search(k)` (the exact best `k` hits of the clause among the
+    /// allowed rows, ties broken by row): all hits scoring above the `k`th are present, so once every
+    /// group that has an allowed row holds `per` of them, the lower rows cannot place in their groups,
+    /// and the answer equals the one from every hit. Otherwise `k` grows until the list is the whole
+    /// result.
+    pub(crate) async fn hits<F, Fut>(
+        &self,
+        allowed: &RoaringBitmap,
+        mut search: F,
+    ) -> std::io::Result<Vec<bf_text::SearchHit>>
+    where
+        F: FnMut(usize) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Vec<bf_text::SearchHit>>>,
+    {
+        let mut present: Option<Vec<bool>> = None;
+        let mut k = FIRST_K;
+        loop {
+            let mut hits = search(k).await?;
+            if hits.len() < k || k as u64 >= allowed.len() {
+                return Ok(hits);
+            }
+            // Rows tied with the last hit may be missing, so only the strictly better ones count.
+            let cut = hits.iter().map(|h| h.score).fold(f32::INFINITY, f32::min);
+            hits.retain(|h| h.score > cut);
+            let mut held = vec![0usize; self.codes.space as usize];
+            for h in &hits {
+                held[self.codes.tuple(h.row) as usize] += 1;
+            }
+            if held.iter().all(|&n| n >= self.per) {
+                return Ok(hits);
+            }
+            // A group short of `per` is fine when no allowed row belongs to it.
+            let present = present.get_or_insert_with(|| {
+                let mut present = vec![false; self.codes.space as usize];
+                for row in allowed {
+                    present[self.codes.tuple(row) as usize] = true;
+                }
+                present
+            });
+            if held
+                .iter()
+                .zip(present.iter())
+                .all(|(&n, &here)| n >= self.per || !here)
+            {
+                return Ok(hits);
+            }
+            k = k.saturating_mul(WIDEN);
+        }
+    }
+}
+
 /// The segment's rows that can appear in the answer: its best `k` rows by score (ties by ID), or
 /// each group's best `per.limit` rows under `limit.per`. `hits` holds each clause's hits (every
 /// matching row) in `clauses` order. Rows scoring 0 or less never rank, as in the full scorer.
@@ -133,13 +280,11 @@ pub(crate) async fn select(
     let ids = segment::ids(store, seg).await?;
     crate::ann::stage(started, "ordinal ids");
     let per = q.limit.as_ref().and_then(Limit::per);
-    // One scalar group attribute with a filter dictionary groups by integer code (see
-    // `segment::group_codes`): no column is projected for it and no key is built.
+    // Scalar group attributes that all have a filter dictionary group by one integer tuple of their
+    // codes (see `segment::group_codes`): no column is projected for them and no key is built.
     let codes = match per {
-        Some(per) if per.attributes.len() == 1 => {
-            segment::group_codes(store, seg, &state.schema, &per.attributes[0], ids.len()).await?
-        }
-        _ => None,
+        Some(per) => tuple_codes(store, state, seg, &per.attributes, ids.len()).await?,
+        None => None,
     };
     let mut columns = BTreeSet::new();
     attributes(rank, &mut columns);
@@ -166,7 +311,10 @@ pub(crate) async fn select(
     let mut best: BinaryHeap<Contender> = BinaryHeap::new();
     let mut groups: HashMap<String, BinaryHeap<Contender>> = HashMap::new();
     let mut coded: Vec<BinaryHeap<Contender>> = Vec::new();
-    coded.resize_with(codes.as_ref().map_or(0, |c| c.groups), Default::default);
+    let mut sparse: HashMap<u32, BinaryHeap<Contender>> = HashMap::new();
+    if let Some(c) = codes.as_ref().filter(|c| c.dense()) {
+        coded.resize_with(c.space as usize, Default::default);
+    }
     if crate::ann::trace_stages() {
         eprintln!("STAGE ordinal rows {} of {}", rows.len(), allowed.len());
     }
@@ -214,7 +362,12 @@ pub(crate) async fn select(
             };
             match (per, key, &codes) {
                 (Some(per), _, Some(codes)) => {
-                    offer(&mut coded[codes.codes[row as usize] as usize], c, per.limit)
+                    let t = codes.tuple(row);
+                    if codes.dense() {
+                        offer(&mut coded[t as usize], c, per.limit)
+                    } else {
+                        offer(sparse.entry(t).or_default(), c, per.limit)
+                    }
                 }
                 (Some(per), Some(key), None) => offer(groups.entry(key).or_default(), c, per.limit),
                 _ => offer(&mut best, c, k),
@@ -227,6 +380,7 @@ pub(crate) async fn select(
         .iter()
         .chain(groups.values().flat_map(|h| h.iter()))
         .chain(coded.iter().flat_map(|h| h.iter()))
+        .chain(sparse.values().flat_map(|h| h.iter()))
     {
         selected.insert(c.row);
     }

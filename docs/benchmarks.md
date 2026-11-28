@@ -19469,3 +19469,63 @@ its best bound. The remaining lever is the wave tails (the bundle wave's 62 read
 
 Resources: one on-demand c7gn.4xlarge for 0.4 hours (about $0.4 with the root volume), terminated; its key pair and security group are deleted; nothing was written to the
 bucket (the fixture was only read). Offline sizing ran on this VM.
+
+## Round BW30: `limit.per` over two columns groups by a tuple of codes (about 5 times), and a bounded search stops scoring rows that cannot place (4 to 6 times CPU on one column)
+
+### What shipped
+
+1. **Tuples of codes** (`ordinal_scan::TupleCodes`). When every `limit.per` attribute has group codes (BW29: filterable scalar, at most 65,535
+   values), the codes combine into one `u32` mixed-radix tuple per row, and the heap for each group comes from a direct table (up to 65,536
+   tuples) or a map (more, up to `u32`). Null and missing values keep BW29's shared group per column, so a tuple matches the old
+   `[null, "x"]` JSON key. A column with no codes, or a tuple space past `u32`, takes the column path unchanged.
+2. **A bounded search for `limit.per` over one BM25 clause** (`ordinal_scan::GroupedSearch`, used by `indexed.rs`). The exhaustive scorer
+   collected every matching row (about 125 ms of CPU a query at 1M rows) only to keep `per` rows per group. Now the segment asks the text index for
+   its best 512 rows and checks the groups: rows scoring strictly above the 512th are all present, so when every group that has an allowed
+   row holds `per` of them, nothing outside the list can place in its group, and the answer equals the one from all hits. Otherwise `k`
+   grows by 4 times until the list is the whole result (so a query with a group that never matches costs one exhaustive search plus the
+   bounded ones). Ties at the cut are dropped from the list, not trusted, so ID tie-breaks stay exact. This reuses the existing block-max
+   pruning of top-k search; it needs no new bound, setting, or format change.
+
+### Measurement
+
+Fixture: BW29's 1M MS MARCO passages on local disk (8 text segments, 4 Rayon workers), now with a second filterable column `cat2 = (id // 8) % 5`
+(`bench/scale/bw29_load.py`), so `limit.per` over `["cat", "cat2"]` has 40 groups. Driver: `bw29_ab.py` with the new `per2c1` and `per2c3`
+shapes (`per` limit 1 and 3), fresh process per round, order alternating, medians of 3 rounds, unseen query slices (as BW29). A is v0.1.82,
+B is the candidate. Ordered IDs and scores of **every** answer are identical (all shapes, both client counts, cold).
+
+Item 1 alone (tuples of codes), p50 / CPU ms a query:
+
+| Shape | A | B | p50 gain | CPU gain |
+| --- | --- | --- | ---: | ---: |
+| `per2c1`, 1 client | 172.6 / 697 | 33.4 / 119 | **5.17** | 5.87 |
+| `per2c3`, 1 client | 172.6 / 690 | 34.7 / 123 | **4.97** | 5.62 |
+| `per2c1`, 16 clients | 2,147 / 754 | 415 / 129 | **5.17** | 5.84 |
+| `per2c3`, 16 clients | 2,092 / 747 | 409 / 130 | **5.12** | 5.76 |
+| `per2c1`, cold | 151.9 / 620 | 32.4 / 124 | **4.69** | 5.01 |
+| `per2c3`, cold | 143.2 / 597 | 31.6 / 115 | **4.53** | 5.19 |
+| `per1` and `per3` (one column, control) | 33.1 | 32.8 | 1.01 | 0.96 |
+
+Items 1 and 2 together (the second pair of runs, on a busier VM, so the A column is slower than above; compare ratios):
+
+| Shape | A p50 / CPU | B p50 / CPU | p50 gain | CPU gain |
+| --- | --- | --- | ---: | ---: |
+| `per1`, 1 client | 46.9 / 127 | 13.1 / 26.4 | 3.59 | **4.80** |
+| `per3`, 1 client | 46.3 / 126 | 11.3 / 22.5 | 4.11 | **5.58** |
+| `per2c1`, 1 client | 255 / 813 | 11.3 / 23.8 | 22.7 | 34.2 |
+| `per2c3`, 1 client | 245 / 795 | 14.3 / 28.2 | 17.2 | 28.2 |
+| `per1`, 16 clients | 590 / 162 | 113 / 27.4 | 5.23 | **5.91** |
+| `per3`, 16 clients | 514 / 126 | 98.4 / 24.1 | 5.22 | 5.21 |
+| `per1`, cold | 51.3 / 143 | 13.8 / 35.8 | 3.72 | **3.99** |
+| `per3`, cold | 48.2 / 121 | 10.9 / 25.7 | 4.44 | 4.70 |
+| `per2c1`, cold | 223 / 735 | 11.8 / 24.3 | 18.9 | 30.2 |
+| `per2c3`, cold | 218 / 709 | 13.4 / 28.3 | 16.3 | 25.0 |
+
+Both pass: item 1's bar was 1.3 times p50 on two columns (5.0 times), and item 2's was 1.25 times CPU on the eight-group workload (4.0 to 5.9
+times). "Cold" here is a fresh process on local disk, not S3. Local only (no EC2 or S3 run).
+
+### Tests
+
+`tests/limit_per_codes.rs` compares the fast path with the full scorer (`query_exhaustive`) across segments, a WAL tail, and a reindex:
+two- and three-attribute tuples (including repeated and reordered attributes), a plain attribute in the tuple (column fallback), a tuple
+space of 84,300 (the map), and `bounded_group_search_widens_until_every_group_is_full` (3,600 rows, a group that scores below the first 512
+rows, a group that never matches, ties, deletes, and offsets).

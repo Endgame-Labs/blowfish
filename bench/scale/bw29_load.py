@@ -2,7 +2,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["httpx==0.28.1"]
 # ///
-"""Round BW29: load a local MS MARCO corpus.jsonl (id, docid, text) with a `cat` column (id % 8, filterable).
+"""Round BW29: load a local MS MARCO corpus.jsonl (id, docid, text) with `cat` (id % 8) and, since Round BW30, `cat2` ((id // 8) % 5) columns, both filterable ints.
 
 Usage: bw29_load.py CORPUS_JSONL BASE_URL NAMESPACE [--rows 1000000]
 """
@@ -33,7 +33,8 @@ def main():
     a = p.parse_args()
     url = f"{a.base_url}/v2/namespaces/{a.namespace}"
     schema = {"text": {"type": "string", "full_text_search": True},
-              "cat": {"type": "int", "filterable": True}}
+              "cat": {"type": "int", "filterable": True},
+              "cat2": {"type": "int", "filterable": True}}
     pool = ThreadPoolExecutor(a.inflight)
     pending, batch, rows, t0 = [], [], 0, time.monotonic()
     with httpx.Client(timeout=300) as cl, open(a.corpus) as f:
@@ -51,7 +52,7 @@ def main():
         for line in f:
             d = json.loads(line)
             i = int(d["docid"])
-            batch.append({"id": i, "text": d["text"], "cat": i % 8})
+            batch.append({"id": i, "text": d["text"], "cat": i % 8, "cat2": (i // 8) % 5})
             rows += 1
             if len(batch) == a.batch:
                 flush(rows == a.batch)
