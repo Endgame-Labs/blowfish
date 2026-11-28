@@ -6,14 +6,6 @@ const MAX: usize = 4096;
 const FIRST: usize = 32;
 const WINDOW: usize = 512;
 
-// G26 TEMPORARY: standard errors of margin required (env G26_MARGIN), removed before done.
-fn margin() -> f64 {
-    std::env::var("G26_MARGIN")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.)
-}
-
 pub(super) struct Effort {
     pub trial: usize,
     pub serving: Option<usize>,
@@ -56,10 +48,6 @@ impl Effort {
             / n.saturating_sub(1).max(1) as f64;
         let radius = 1.96 * ((variance + 0.25 / n as f64) / n as f64).sqrt();
         (graph, ivf, gap - radius, gap + radius)
-    }
-    fn standard_error(&self) -> f64 {
-        let (_, _, lower, upper) = self.statistics();
-        (upper - lower) / (2. * 1.96)
     }
     pub fn settled(&self) -> bool {
         self.serving == Some(self.trial)
@@ -106,9 +94,10 @@ impl Effort {
                 } else {
                     self.trial = (self.trial * 5).div_ceil(4).min(MAX);
                 }
-            } else if lower > 0.
-                || (self.len() == WINDOW && g - i >= margin() * self.standard_error())
-            {
+            } else if lower > 0. || (self.len() == WINDOW && g >= i) {
+                // Accept on a positive lower bound, or on a full window with no deficit. A
+                // shorter window's mean alone is too noisy: at 150 queries the interval is
+                // about +-0.022, and a 0.015 deficit passed on luck (Round G26).
                 // Preserve a validated serving effort while cheaper trials explore below it.
                 self.serving = Some(self.trial);
                 if self.len() == WINDOW && lower > 0. {
@@ -213,5 +202,36 @@ mod tests {
             }
         }
         panic!("unattainable quality did not terminate");
+    }
+
+    #[test]
+    fn parity_is_accepted_only_on_the_full_window() {
+        // Round G26: a 150-query window accepted a graph 0.012 below IVF on real data, because the
+        // sample mean was above zero by luck. Without a positive lower bound, only a full window
+        // may decide, and then only on a gap of at least zero.
+        let mut e = Effort::new();
+        for n in 1..=WINDOW {
+            let d = if n % 2 == 0 { 0.1 } else { -0.1 };
+            e.observe(0.9 + d, 0.9);
+            if n < WINDOW {
+                assert!(e.serving.is_none(), "accepted at {n} samples");
+            }
+        }
+        assert_eq!(e.serving, Some(MIN));
+    }
+
+    #[test]
+    fn a_graph_below_ivf_is_never_accepted_at_that_effort() {
+        let mut e = Effort::new();
+        for n in 0..WINDOW {
+            // Query noise around a true deficit of 0.012.
+            let noise = if n % 2 == 0 { 0.05 } else { -0.05 };
+            e.observe(0.9 + noise - 0.012, 0.9 + noise);
+            assert_ne!(e.serving, Some(MIN));
+            if e.trial != MIN {
+                break;
+            }
+        }
+        assert!(e.trial > MIN, "the deficit must raise the effort");
     }
 }

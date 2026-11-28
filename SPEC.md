@@ -106,7 +106,8 @@ log entry in the same commit.
   over leaf centers, held with the paged directory, is allowed (decision 26; `docs/design/graph-index.md`).
 - **Automatic warm graphs** (round G4, decision 29): for hot, immutable cosine-f16 tiers, the engine builds an SQ8 Vamana
   graph over rows in RAM, at idle priority, when measured heat pays for it, and serves unfiltered ANN from it only after
-  paired recall checks against IVF pick a serving effort. It is never written to the bucket and never causes an object
+  paired recall checks against IVF pick a serving effort (a trial is accepted on a positive lower bound or a full
+  512-query window with no deficit, round G26) and it serves `top_k` plus `offset` up to 256. It is never written to the bucket and never causes an object
   read during traversal; restart, eviction, or refusal falls back to IVF. There is no setting
   (`docs/design/hot-tier-graph.md`).
 - **BM25** (round 13): window-pruned posting reads (exact, not approximate), the term record stored before its
@@ -290,3 +291,7 @@ S3 until the run is cleaned up.
     builds a segment ANN index (Round CS1). Segment row caps stay as they are: fewer, larger segments were measured
     1.31 times slower on cold ID filters, because the cost is the depth of each segment's ID seek, not the number
     of segments.
+32. 2026-11-28: The warm graph's serving effort is accepted only on a positive lower bound of the paired recall gap
+    or on a full 512-query window whose mean gap is not negative, and the graph serves `top_k` plus `offset` up to 256
+    (Round G26). On the M4, v0.1.79's 128-sample mean rule accepted the floor effort 64 three times in three runs,
+    which served 0.012 to 0.018 of recall@10 below IVF, against decision 29's requirement of at least IVF's.

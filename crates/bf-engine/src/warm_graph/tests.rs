@@ -222,7 +222,9 @@ async fn source_identity_masks_wal_fallback_and_reservation_lifetimes() {
         calibration.quality = effort::Effort::new();
         calibration.build_seconds = 1.;
     }
-    for _ in 0..128 {
+    for _ in 0..512
+    /* a full effort window: Round G26 */
+    {
         let scope = Scope::new(e.0.hot_graph.clone(), "hot").trial();
         *scope.used.lock().unwrap() = Some(vec![key.clone()]);
         held.calibration.lock().unwrap().trial_ratio = 0.1;
@@ -1106,7 +1108,9 @@ async fn shadowed_rows_stay_traversable_but_are_never_returned() {
         calibration.build_seconds = 1.;
     }
     let key = Key::new("hot", &state, "vector", set);
-    for _ in 0..128 {
+    for _ in 0..512
+    /* a full effort window: Round G26 */
+    {
         let scope = Scope::new(e.0.hot_graph.clone(), "hot").trial();
         *scope.used.lock().unwrap() = Some(vec![key.clone()]);
         held.calibration.lock().unwrap().trial_ratio = 0.1;
