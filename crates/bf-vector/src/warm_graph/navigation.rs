@@ -100,102 +100,16 @@ impl<'a> Screen<'a> {
         h > tail.saturating_add(self.margin)
     }
 }
-/// A sorted sequence kept in chunks, for the beam of a wide search: inserting into one chunk moves
-/// at most [`Chunks::MAX`] entries, where a single sorted array moves up to the whole beam (about
-/// 24 KiB for 2,000 entries, once per accepted node, which was a third of a wide filtered walk).
-#[derive(Default)]
-struct Chunks {
-    chunks: Vec<Vec<BeamHit>>,
-    /// Emptied chunks kept for the next search, so a search allocates nothing in steady state.
-    spare: Vec<Vec<BeamHit>>,
-    len: usize,
-}
-impl Chunks {
-    /// A chunk longer than this splits in two.
-    const MAX: usize = 256;
-    fn clear(&mut self) {
-        for mut chunk in self.chunks.drain(..) {
-            chunk.clear();
-            self.spare.push(chunk);
-        }
-        self.len = 0;
-    }
-    fn last(&self) -> Option<&BeamHit> {
-        self.chunks.last().and_then(|chunk| chunk.last())
-    }
-    fn insert(&mut self, item: BeamHit) {
-        self.len += 1;
-        let at = self
-            .chunks
-            .partition_point(|chunk| chunk.last().is_some_and(|last| last.hit < item.hit));
-        // Past every chunk's last entry: it belongs at the end of the final chunk.
-        let at = at.min(self.chunks.len().saturating_sub(1));
-        if self.chunks.is_empty() {
-            let mut chunk = self.spare.pop().unwrap_or_default();
-            chunk.push(item);
-            self.chunks.push(chunk);
-            return;
-        }
-        let chunk = &mut self.chunks[at];
-        let pos = chunk.partition_point(|b| b.hit < item.hit);
-        chunk.insert(pos, item);
-        if chunk.len() > Self::MAX {
-            let mut upper = self.spare.pop().unwrap_or_default();
-            upper.extend_from_slice(&chunk[Self::MAX / 2..]);
-            chunk.truncate(Self::MAX / 2);
-            self.chunks.insert(at + 1, upper);
-        }
-    }
-    fn pop_last(&mut self) {
-        let Some(chunk) = self.chunks.last_mut() else {
-            return;
-        };
-        chunk.pop();
-        self.len -= 1;
-        if chunk.is_empty() {
-            let chunk = self.chunks.pop().expect("a last chunk");
-            self.spare.push(chunk);
-        }
-    }
-    /// Mean Hamming distance (rounded up) of the [`TAIL`] worst entries.
-    fn tail_hamming(&self) -> u16 {
-        let n = TAIL.min(self.len).max(1);
-        let (mut sum, mut seen) = (0u32, 0);
-        for b in self
-            .chunks
-            .iter()
-            .rev()
-            .flat_map(|chunk| chunk.iter().rev())
-        {
-            if seen == n {
-                break;
-            }
-            sum += u32::from(b.h);
-            seen += 1;
-        }
-        sum.div_ceil(n as u32) as u16
-    }
-    fn hits(&self) -> Vec<Hit> {
-        self.chunks
-            .iter()
-            .flat_map(|chunk| chunk.iter().map(|b| b.hit))
-            .collect()
-    }
-}
 /// Reusable, exact visitation and one sorted beam. Its owner reserves retained capacity.
 pub struct Scratch {
     visited: Visited,
     beam: Vec<BeamHit>,
-    wide: Chunks,
-    unexpanded: std::collections::BinaryHeap<std::cmp::Reverse<Hit>>,
 }
 impl Scratch {
     pub fn new(n: usize) -> Self {
         Self {
             visited: Visited::new(n),
             beam: Vec::new(),
-            wide: Chunks::default(),
-            unexpanded: Default::default(),
         }
     }
     /// Mean Hamming distance (rounded up) of the beam's [`TAIL`] worst members.
@@ -243,102 +157,6 @@ impl Scratch {
             screen,
         );
         (self.beam.iter().map(|b| b.hit).collect(), evaluations)
-    }
-    /// [`Self::search_prefetched`] for a wide beam (`ef` in the thousands): the same nodes, scores,
-    /// and order, with the beam in chunks and the unexpanded nodes in a heap, so each accepted
-    /// node moves at most [`Chunks::MAX`] entries instead of up to `ef`. Tests hold it equal to
-    /// the sorted-array search, with and without a screen.
-    #[allow(clippy::too_many_arguments)]
-    pub fn search_wide(
-        &mut self,
-        links: &[[u32; 34]],
-        degrees: &[u8],
-        entry: u32,
-        ef: usize,
-        mut score: impl FnMut(u32) -> f32,
-        mut prefetch: impl FnMut(u32),
-        screen: Option<Screen>,
-    ) -> (Vec<Hit>, usize) {
-        use std::cmp::Reverse;
-        self.visited.begin();
-        self.wide.clear();
-        self.unexpanded.clear();
-        self.visited.insert(entry);
-        let start = Hit {
-            id: entry,
-            distance: score(entry),
-        };
-        self.wide.insert(BeamHit {
-            hit: start,
-            h: screen.map_or(0, |sc| sc.bits.hamming(sc.query, entry)),
-            expanded: false,
-        });
-        self.unexpanded.push(Reverse(start));
-        let mut evaluations = 1;
-        let mut pending = [0u32; MAX_LINKS];
-        while let Some(Reverse(current)) = self.unexpanded.pop() {
-            // An unexpanded node the beam has since dropped is worse than its last entry, and so
-            // is every node still waiting: the search is over.
-            if current > self.wide.last().expect("a non-empty beam").hit {
-                break;
-            }
-            let degree = degrees[current.id as usize] as usize;
-            let mut count = 0;
-            for &id in &links[current.id as usize][..degree] {
-                if self.visited.insert(id) {
-                    pending[count] = id;
-                    count += 1;
-                }
-            }
-            let pending = &pending[..count];
-            let mut hamming = [0u16; MAX_LINKS];
-            if let Some(screen) = &screen {
-                for &id in pending {
-                    screen.bits.prefetch(id);
-                }
-                for (h, &id) in hamming.iter_mut().zip(pending) {
-                    *h = screen.bits.hamming(screen.query, id);
-                }
-            }
-            let mut tail = self.wide.tail_hamming();
-            let rejected = |beam_full: bool, tail: u16, h: u16| {
-                beam_full && screen.is_some_and(|screen| screen.skips(tail, h))
-            };
-            let (mut ahead, mut issued) = (0, 0);
-            for position in 0..pending.len() {
-                while issued < position + 3 && ahead < pending.len() {
-                    if !rejected(self.wide.len >= ef, tail, hamming[ahead]) {
-                        prefetch(pending[ahead]);
-                        issued += 1;
-                    }
-                    ahead += 1;
-                }
-                let (id, h) = (pending[position], hamming[position]);
-                if rejected(self.wide.len >= ef, tail, h) {
-                    continue;
-                }
-                let hit = Hit {
-                    id,
-                    distance: score(id),
-                };
-                evaluations += 1;
-                if self.wide.len < ef || hit < self.wide.last().unwrap().hit {
-                    self.wide.insert(BeamHit {
-                        hit,
-                        h,
-                        expanded: false,
-                    });
-                    self.unexpanded.push(Reverse(hit));
-                    if self.wide.len > ef {
-                        self.wide.pop_last();
-                    }
-                    if screen.is_some() {
-                        tail = self.wide.tail_hamming();
-                    }
-                }
-            }
-        }
-        (self.wide.hits(), evaluations)
     }
     /// The shared beam search, for serving and for graph construction. `adjacent` copies one
     /// node's neighbors into the buffer and returns their count (at most [`MAX_LINKS`]).
