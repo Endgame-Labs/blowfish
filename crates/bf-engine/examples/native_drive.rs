@@ -261,6 +261,8 @@ fn main() {
                     .as_i64()
                     .or_else(|| r["id"].as_str().and_then(|s| s.parse().ok()))
                     .or_else(|| r["id"].as_str().and_then(row_of_uuid))
+                    // Round G28's string IDs end in the row number: `nq:doc:00000123`.
+                    .or_else(|| r["id"].as_str()?.rsplit(':').next()?.parse().ok())
                     .unwrap();
                 want.contains(&(id as i32))
             })

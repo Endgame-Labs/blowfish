@@ -1229,6 +1229,10 @@ fn g28_switch() -> Arc<str> {
     }
     cell.1.clone()
 }
+/// TEMPORARY (Round G28): whether the switch text names `word`.
+pub(crate) fn g28_switch_has(word: &str) -> bool {
+    g28_switch().contains(word)
+}
 /// TEMPORARY (Round G28): a `name=value` number in the switch text.
 fn g28_param(switch: &str, name: &str, default: u64) -> u64 {
     switch
