@@ -1,0 +1,319 @@
+diff --git a/crates/bf-engine/src/ann_dir.rs b/crates/bf-engine/src/ann_dir.rs
+index 427933c..2a08954 100644
+--- a/crates/bf-engine/src/ann_dir.rs
++++ b/crates/bf-engine/src/ann_dir.rs
+@@ -1514,6 +1514,7 @@ pub(crate) async fn search(
+         );
+     }
+     let vector_key = vector_hash(&vector);
++    let c39 = c39_path().map(|_| Arc::new(std::sync::Mutex::new(C39Acc::default())));
+     // A completed slab (or streamed batch) with k witnesses supplies a valid global cut to scans
+     // that have not run yet. Read planning stays concurrent; busy warm queries scan on their own
+     // thread.
+@@ -1645,6 +1646,7 @@ pub(crate) async fn search(
+     for (i, cs) in batches {
+         let scan_upper = scan_upper.clone();
+         let (dir, vector, rotated) = (dir.clone(), vector.clone(), rotated.clone());
++        let c39 = c39.clone();
+         let exact = exact_segments.contains(&i);
+         let flat = dir.segments()[i].flat;
+         let file = state.segments[i]
+@@ -1671,6 +1673,7 @@ pub(crate) async fn search(
+         let mut ns = cs.clone();
+         ns.sort_unstable();
+         let seg_entries: Vec<_> = ns.iter().map(|n| entries[*n].clone()).collect();
++        let c39_dist: Vec<f32> = ns.iter().map(|&n| distances[n]).collect();
+         let trace_t0 = t0;
+         let warm = warm.clone();
+         tasks.push(
+@@ -1769,6 +1772,11 @@ pub(crate) async fn search(
+                     exact,
+                 };
+                 let install_done = trace_t0.elapsed().as_micros();
++                let c39_spans: Vec<[u64; 4]> = seg_entries
++                    .iter()
++                    .map(|e| [e.blob_range().start, e.blob_range().end, e.codes_range().start, e.codes_range().end])
++                    .collect();
++                let c39_cif = dir.segments()[i].codes_in_fragment;
+                 let found = on_worker(async move {
+                     if exact {
+                         let hits = index
+@@ -1780,6 +1788,20 @@ pub(crate) async fn search(
+                             Vec::new(),
+                         ));
+                     }
++                    if let Some(acc) = &c39 {
++                        let (mut rows, mut leaves) = (Vec::new(), Vec::new());
++                        let spans: Vec<[u64; 4]> = c39_spans;
++                        let c39_dist = c39_dist;
++                        for (position, &cid) in wanted.iter().enumerate() {
++                            let (n, matching, blocks, hit) = index
++                                .c39_dump_leaf(&rotated, cid, &codes[position], live.as_deref(), &mut rows)
++                                .map_err(segment::index_error)?;
++                            leaves.push((i as u32, cid as u32, n as u32, matching as u32, blocks as u32, hit as u32, codes[position].len() as u32, c39_cif as u32, spans[position], c39_dist[position].to_bits()));
++                        }
++                        let mut a = acc.lock().unwrap();
++                        a.rows.extend(rows.into_iter().map(|r| (i as u32, r.0, r.1, r.2, r.3, r.4, r.5)));
++                        a.leaves.extend(leaves);
++                    }
+                     // The rerank below keeps only candidates whose lower bound is within the
+                     // k-th smallest upper bound, so the scan drops the rest as it goes.
+                     let found = index
+@@ -1997,14 +2019,21 @@ pub(crate) async fn search(
+     let mut winners: Vec<(f32, usize, u32)> = Vec::new(); // (exact distance, segment, row)
+     let mut pool: Vec<(usize, Candidate)> = Vec::new();
+     let mut indexes: BTreeMap<usize, Arc<Index<Reader>>> = BTreeMap::new();
++    let mut c39_owner: BTreeMap<(usize, u32), usize> = BTreeMap::new();
+     let mut sources = Vec::new();
+     for (n, (probed, (exact_hits, found))) in results.into_iter().enumerate() {
+         let _ = (&probed.clusters, probed.exact);
+         winners.extend(exact_hits.into_iter().map(|(d, r)| (d, probed.segment, r)));
+         pool.extend(found.into_iter().map(|c| (n, c)));
++        for &cluster in &probed.clusters {
++            c39_owner.insert((probed.segment, cluster as u32), n);
++        }
+         sources.push(probed.segment);
+         indexes.insert(n, probed.index);
+     }
++    if let Some(acc) = c39.clone() {
++        c39_finish(acc, c39_owner, &indexes, &vector, k).await?;
++    }
+     let cmp = |a: &(usize, Candidate), b: &(usize, Candidate)| {
+         a.1.distance
+             .total_cmp(&b.1.distance)
+@@ -2162,6 +2191,124 @@ pub(crate) async fn search(
+     hydrated
+ }
+ 
++
++// ---- TEMPORARY Round C39 dump hook (not to be merged; removed before done) ----
++type C39Row = (u32, u32, u32, u32, f32, f32, [f32; 5]); // seg, cluster, ordinal, row, d1, e1, estimates
++type C39Leaf = (u32, u32, u32, u32, u32, u32, u32, u32, [u64; 4], u32); // seg, cluster, rows, matching, blocks, hit, code bytes, codes in fragment, [blob start, blob end, codes start, codes end]
++#[derive(Default)]
++struct C39Acc {
++    rows: Vec<C39Row>,
++    leaves: Vec<C39Leaf>,
++}
++static C39_QUERY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++
++fn c39_path() -> Option<std::path::PathBuf> {
++    std::env::var_os("BF_C39_DUMP").map(Into::into)
++}
++
++async fn c39_finish(
++    acc: Arc<std::sync::Mutex<C39Acc>>,
++    owner: BTreeMap<(usize, u32), usize>,
++    indexes: &BTreeMap<usize, Arc<Index<Reader>>>,
++    vector: &[f32],
++    k: usize,
++) -> Result<(), ApiError> {
++    use std::io::Write;
++    let Some(path) = c39_path() else { return Ok(()) };
++    let (rows, mut leaves) = {
++        let mut a = acc.lock().unwrap();
++        (std::mem::take(&mut a.rows), std::mem::take(&mut a.leaves))
++    };
++    leaves.sort_unstable();
++    let leaf_of = |seg: u32, cluster: u32| leaves.binary_search_by_key(&(seg, cluster), |l| (l.0, l.1)).unwrap();
++    let n = rows.len();
++    let top = |key: &dyn Fn(&C39Row) -> f32, m: usize| -> Vec<usize> {
++        let mut idx: Vec<usize> = (0..n).collect();
++        let m = m.min(n);
++        if m > 0 && m < n {
++            idx.select_nth_unstable_by(m - 1, |&a, &b| key(&rows[a]).total_cmp(&key(&rows[b])));
++        }
++        idx.truncate(m);
++        idx
++    };
++    let mut chosen: BTreeSet<usize> = BTreeSet::new();
++    let top256: usize = std::env::var("BF_C39_TOP256").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
++    chosen.extend(top(&|r| r.4 - r.5, 300));
++    chosen.extend(top(&|r| r.6[0], top256));
++    chosen.extend(top(&|r| r.4, 100));
++    let chosen: Vec<usize> = chosen.into_iter().collect();
++    let mut exact: Vec<f32> = vec![f32::NAN; chosen.len()];
++    if std::env::var_os("BF_C39_EXACT").is_some() && !chosen.is_empty() {
++        let mut per: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
++        for &i in &chosen {
++            let r = &rows[i];
++            let o = owner[&(r.0 as usize, r.1)];
++            per.entry(o).or_default().push((r.1, r.2));
++        }
++        let reads = per.into_iter().map(|(o, locs)| {
++            let (index, vector) = (indexes[&o].clone(), vector.to_vec());
++            async move {
++                let len = locs.len();
++                index.rerank_candidates(&vector, len, locs).await.map_err(segment::index_error)
++            }
++        });
++        let parts = futures::stream::iter(reads).buffer_unordered(64).try_collect::<Vec<_>>().await?;
++        let by_row: std::collections::HashMap<u32, f32> = parts.into_iter().flatten().collect();
++        for (slot, &i) in exact.iter_mut().zip(&chosen) {
++            if let Some(d) = by_row.get(&rows[i].3) {
++                *slot = *d;
++            }
++        }
++    }
++    let mut out: Vec<u8> = Vec::new();
++    let put = |out: &mut Vec<u8>, v: u32| out.extend(v.to_le_bytes());
++    put(&mut out, 0xC39);
++    put(&mut out, C39_QUERY.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
++    put(&mut out, k as u32);
++    put(&mut out, n as u32);
++    put(&mut out, leaves.len() as u32);
++    put(&mut out, chosen.len() as u32);
++    for x in vector.iter().take(8) {
++        out.extend(x.to_le_bytes());
++    }
++    for l in &leaves {
++        for v in [l.0, l.1, l.2, l.3, l.4, l.5, l.6, l.7] {
++            put(&mut out, v);
++        }
++        for v in l.8 {
++            out.extend(v.to_le_bytes());
++        }
++        put(&mut out, l.9);
++    }
++    for r in &rows {
++        put(&mut out, leaf_of(r.0, r.1) as u32);
++    }
++    for r in &rows {
++        put(&mut out, r.2);
++    }
++    for r in &rows {
++        out.extend(r.4.to_le_bytes());
++    }
++    for r in &rows {
++        out.extend(r.5.to_le_bytes());
++    }
++    for e in 0..5 {
++        for r in &rows {
++            out.extend(r.6[e].to_le_bytes());
++        }
++    }
++    for &i in &chosen {
++        put(&mut out, i as u32);
++    }
++    for d in &exact {
++        out.extend(d.to_le_bytes());
++    }
++    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(segment::index_error)?;
++    f.write_all(&out).map_err(segment::index_error)?;
++    Ok(())
++}
++// ---- end of the C39 hook ----
++
+ #[allow(clippy::too_many_arguments)]
+ async fn hydrate(
+     store: &Storage,
+diff --git a/crates/bf-vector/src/index.rs b/crates/bf-vector/src/index.rs
+index a1dd2de..189481a 100644
+--- a/crates/bf-vector/src/index.rs
++++ b/crates/bf-vector/src/index.rs
+@@ -643,6 +643,106 @@ impl<R: RangeRead> Index<R> {
+         }
+     }
+ 
++    /// TEMPORARY (Round C39, not to be merged): for the rows of one probed leaf passing `filter`,
++    /// the 1,024-bit RaBitQ estimate and error bound, and the estimate from only the first 256 code
++    /// bits (the 256-bit estimate scales the dot product by `padded / 256`). Returns
++    /// `(rows, matching, blocks, blocks with a match)`.
++    pub fn c39_dump_leaf(
++        &self,
++        query: &RotatedQuery,
++        cid: usize,
++        bytes: &[u8],
++        filter: Option<&RoaringBitmap>,
++        out: &mut Vec<(u32, u32, u32, f32, f32, [f32; 5])>,
++    ) -> Result<(usize, usize, usize, usize)> {
++        let c = &self.metadata.clusters[cid];
++        let n = c.len();
++        let padded = self.rq.padded;
++        let blk = crate::fastscan::BLOCK;
++        if n == 0 || bytes.len() != crate::fastscan::block_len(n, padded) {
++            return Ok((n, 0, n.div_ceil(blk), 0));
++        }
++        let ids: Vec<u32> = match c.ids.as_deref() {
++            Some(ids) => ids.to_vec(),
++            None => c.rows.iter().collect(),
++        };
++        let cosine = self.metric() == Metric::CosineDistance;
++        let (half, top) = if cosine { (0.5f32, 2f32) } else { (1f32, f32::INFINITY) };
++        let qc2 = crate::distance::l2_squared_f32(&query.rotated32, &c.center);
++        let root = (padded as f32).sqrt();
++        let spread = crate::rabitq::ERROR_CONFIDENCE as f32 * 2. * qc2.max(0.).sqrt()
++            / ((padded - 1).max(1) as f32).sqrt();
++        let (factors, codes) = bytes.split_at(16 * n);
++        let factor = |i: usize, r: usize| {
++            f32::from_le_bytes(factors[(i * n + r) * 4..(i * n + r) * 4 + 4].try_into().unwrap())
++        };
++        // Per code byte `t` and value `v`: the sum of b_i y_i over its eight dimensions.
++        let width = padded / 8;
++        let mut table = vec![0f32; width * 256];
++        for t in 0..width {
++            let y: Vec<f32> = (0..8)
++                .map(|i| (query.rotated[8 * t + i] - f64::from(c.center[8 * t + i])) as f32)
++                .collect();
++            for v in 0..256usize {
++                let mut s = 0f32;
++                for (i, yi) in y.iter().enumerate() {
++                    s += if v >> i & 1 == 1 { *yi } else { -*yi };
++                }
++                table[t * 256 + v] = s;
++            }
++        }
++        let stripe = width / 4;
++        let (mut matching, mut hit) = (0usize, std::collections::BTreeSet::new());
++        for r in 0..n {
++            let row = ids.get(r).copied().unwrap_or(u32::MAX);
++            if filter.is_some_and(|f| !f.contains(row)) {
++                continue;
++            }
++            matching += 1;
++            hit.insert(r / blk);
++            let block = &codes[r / blk * width * blk..][..width * blk];
++            let j = r % blk;
++            let (mut full, mut part) = (0f32, 0f32);
++            // Prefix sums at 128, 256, 384, and 512 bits.
++            let mut prefix = [0f32; 4];
++            for t in 0..width {
++                let s = table[t * 256 + block[t * blk + j] as usize];
++                full += s;
++                if t < stripe {
++                    part += s;
++                }
++                if t < width / 2 {
++                    prefix[t / (width / 8)] += s;
++                }
++            }
++            let (p128, p384, p512) = (prefix[0], prefix[0] + prefix[1] + prefix[2], prefix[0] + prefix[1] + prefix[2] + prefix[3]);
++            let (sq, signed_k, k2) = (factor(0, r), factor(1, r), factor(2, r));
++            let k = signed_k.abs();
++            let (d, e);
++            let mut est = [0f32; 5];
++            if signed_k.is_sign_negative() || query.zero {
++                d = if query.zero && signed_k.is_sign_negative() { 0. } else { 1. };
++                e = 0.;
++                est = [d; 5];
++            } else {
++                // The table sums are already against `q - c`, so no `cb` term.
++                let dist = |dot: f32| ((sq + qc2 - 2. * k * dot) * half).clamp(0., top);
++                d = dist(full / root);
++                e = spread * k2 * half;
++                // 256 bits scaled by 4 (unbiased), 256 bits unscaled, and 128, 384, and 512 bits scaled to 1,024.
++                est = [
++                    dist(part / root * 4.),
++                    dist(part / root),
++                    dist(p128 / root * 8.),
++                    dist(p384 / root * (8. / 3.)),
++                    dist(p512 / root * 2.),
++                ];
++            }
++            out.push((cid as u32, r as u32, row, d, e, est));
++        }
++        Ok((n, matching, n.div_ceil(blk), hit.len()))
++    }
++
+     /// Rows stored in one leaf cluster.
+     pub fn cluster_rows(&self, cluster: usize) -> usize {
+         self.metadata.clusters[cluster].len()

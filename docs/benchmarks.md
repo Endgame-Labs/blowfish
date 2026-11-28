@@ -18881,6 +18881,130 @@ chain from a `cold_ab.py` run) and `c38_pairs.sh` (the paired runs).
 One c7gn.4xlarge on demand from 01:58 to 02:49 UTC (0.85 hours): about $1.2, under the $6 cap. The instance, key pair, security group, and the S3 prefix (693 objects, 77 GB) are deleted, with no
 multipart uploads left.
 
+## Round C39: reading a quarter of each code first does not halve the cold filtered scan at equal recall (killed offline, no engine change), and two format-free levers are estimated
+
+Neon's idea (03:25 #3): split each leaf's 1,024-bit codes into a first stripe (the first 256 bits of every row) and a second (the other 768), read only the first for the many leaves a selective
+filter probes, and either widen the exact rerank shortlist or read the second stripe only where a leaf holds a survivor. **Killed offline.** At recall no lower than today's, the best a first stripe
+does on the 7.9 percent filter is **1.55 times fewer GET bytes** (384-bit stripe, 618 against 956 MB), and no width reaches the 2 times bar (SPEC 25: no new switches, so no format work started). The 256-bit estimate is the problem: its error is
+4 to 6 times the 1,024-bit error, not the 2 times the idea assumed. Two estimates the coordinator asked for beside the kill test (exact-range reads, and fewer probed leaves) are at the end:
+an exact-range scan path would read about a third fewer bytes (956 to 643 MB at 7.9 percent, modeled 100 ms faster), and probing the nearest `346 x (1/p)^0.7` leaves would read 2.5 times fewer bytes at a recall of 0.993 against today's probed set.
+
+Measured 2026-11-28 on one on-demand c7gn.4xlarge (us-west-2, about 1.2 hours), v0.1.79 plus a temporary dump hook (`c39_hook.patch`, not applied: it computes and writes the numbers below and changes no answer),
+on a private server-side copy of the C5 10M fixture repaired by the baseline writer (55 row maps, about 15 minutes of writable serving). Read-only server, 8 Rayon workers, 64 probes, strong consistency,
+IDs only, 256 KiB blocks, 32-block coalescing, zero disk cache, a full cache drop before every query, one untimed warm-up. 200 queries per shape (oracle queries 0 to 199) for the kill test, 20 for the byte split.
+
+### 1. Where the scan bytes go (`c39_split.py`, 20 cold queries per shape, medians)
+
+| Shape | Leaves probed | Rows / leaf | Matching rows / leaf | 32-row blocks with a match | Code bytes: matching rows | Code bytes: non-matching rows | Block padding | Blobs | Alignment and gap fill | Slab GET MB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 7.9% (`title_initial = s`, 315k matching rows) | 6,179 | 612 | 43 | 77% | 45 MB | 529 MB | 12 MB | 55 MB | 312 MB | 956 |
+| 0.64% (`title_initial = z`, 44k rows) | 9,335 | 695 | 3 | 12.6% | 6 MB | 981 MB | 19 MB | 89 MB | 392 MB | 1,487 |
+| `text_length >= 300` (329k rows, 51%) | 963 | 615 | 283 | 97% | 47 MB | 43 MB | 2 MB | 9 MB | 98 MB | 199 |
+
+Code bytes are 144 per row (16 factor bytes and 128 code bytes). At 7.9 percent only 45 of the 956 MB is the codes of rows that match, and skipping empty blocks cannot help (77 percent of blocks hold a match, as Neon said).
+A third of the bytes (312 MB) are neither codes nor blobs but 256 KiB block rounding and gap fill. That share does not shrink with a smaller code, which caps every stripe design (below).
+
+**Byte model.** The hook records every probed leaf's blob and code byte ranges. Rounding them to 256 KiB blocks (merging ranges under 16 KiB apart, 32-block GETs) reproduces the measured slab GET bytes: 956 modeled against 956 measured (7.9 percent), 1,485 against 1,487
+(0.64 percent), and 195 against 199 (`text_length`). Stripe layouts below are modeled by packing each leaf's blob and first stripe in the leaf's old order, then every second stripe after them, so the cache blocks of the first stripe never pull the second.
+
+### 2. The kill test (`c39_sim.py`, 200 cold queries per shape)
+
+For every matching row of every probed leaf (median 317k at 7.9 percent) the hook dumped the 1,024-bit estimate and bound, five stripe estimates from the stored codes (128, 256 scaled by 4, 256 unscaled, 384, and 512 bits, each scaled to the full inner product), and, for the
+2,000 or so rows a shortlist could pick (the 300 lowest lower bounds, the 1,500 lowest 256-bit estimates, and the 100 lowest 1,024-bit estimates), the exact distance (a median of 103 rows is today's rerank pool).
+The reference answer is the exact top 10 over rows with an exact distance, and today's rule (lower bound within the k-th smallest upper bound) returns it in **all 600 queries**, so "recall" below is against the answer today returns, and against the exact answer of the probed set.
+Today's recall against the oracle's exact filtered truth is 1.000 for `z` and 0.989 for `text_length` (no truth exists for `s`).
+
+Two designs, as briefed: (a) shortlist the N rows with the smallest stripe estimate and rerank them exactly; (b) call a row a survivor when its stripe lower bound (estimate minus `m` times today's 1,024-bit bound) is within the k-th smallest stripe upper bound, read the second stripe of every leaf holding a survivor,
+rescore those leaves with the full code, and rerank by today's rule. Bytes are the modeled slab GETs (blobs, first stripes, second stripes of survivor leaves) plus 2 KiB per reranked row.
+
+**7.9 percent (today 956 MB):**
+
+| Stripe | First stripe only (ratio) | (a) 1,500-row shortlist: recall (queries exact of 200) | (b) smallest `m` that keeps all 200 exact: bytes (ratio), leaves with a second read |
+| --- | ---: | --- | --- |
+| 128 bits | 360 MB (2.66x) | 0.861 (83) | `m` 3.0: 794 MB (1.20x), 2,165 |
+| **256 bits** (the idea) | 458 MB (2.09x) | 0.981 (171) | `m` 2.5: 656 MB (1.46x), 948 |
+| 384 bits | 549 MB (1.74x) | 0.998 (195) | `m` 2.0: **618 MB (1.55x)**, 320 |
+| 512 bits | 635 MB (1.51x) | 0.9995 (199) | `m` 1.5: 665 MB (1.44x), 125 |
+
+At 256 bits the shortlist recall for N of 40, 100, 200, 400, 800, and 1,500 is 0.63, 0.77, 0.86, 0.93, 0.96, and 0.98 (a shortlist of 1,500 is also 1,500 cold vector reads, against about 35 today). Design (b) at 256 bits: `m` 2 gives recall 0.9995 (199 of 200 exact) at 546 MB (1.75x), and `m` 3 gives
+all 200 exact at 803 MB (1.19x).
+**Kill rule** (bytes do not fall at least 2 times at recall no lower than today's): the best equal-recall point is **1.55 times**, and even a perfect survivor choice cannot pass: 256 bits with no second read is 2.09 times (and loses recall: that is design (a)), 384 bits is 1.74 times.
+
+| Shape (today, modeled) | 256 bits (b), all exact | 384 bits (b), all exact | 384 bits (a), 1,500 rows | 512 bits (b), all exact |
+| --- | --- | --- | --- | --- |
+| 0.64% (1,485 MB) | `m` 3.0: 1,025 MB (1.45x) | `m` 2.0: 867 MB (1.71x) | recall 1.000 (200): 766 MB (1.94x) | `m` 2.0: 1,000 MB (1.48x) |
+| `text_length >= 300` (194 MB) | `m` 2.5: 190 MB (1.02x) | `m` 2.5: 188 MB (1.03x) | recall 0.998 (196): 133 MB (1.46x) | `m` 1.5: 158 MB (1.22x) |
+
+The bound multiplier `m` and the stripe choice were picked on the same 200 queries, so these ratios are optimistic. A margin that covers the 256-bit error at 95 percent would be `m` near 5 (all leaves).
+
+### Why it fails
+
+The 1,024-bit estimate's error is 0.40 of its own bound at the median and 1.13 at p95 (the 1.9 sigma bound covers 94 percent, as built). The 256-bit estimate's error is **2.36 (median) and 4.89 (p95) of that same bound**, 6 and 4.3 times larger,
+not the 2 times the idea assumed. Two terms add (a back-of-envelope reading, not separately measured): the code's own noise at 256 bits (2 times), and the missing 768 coordinates: a 256-coordinate stripe carries a quarter of the row, so its inner product with the query, scaled by 4, has a
+standard deviation of about `1/sqrt(256)`, 0.0625 of the vectors' norm product, against 0.0235 for the full code. Unscaled stripes (the `x1` estimate in the dump) have a smaller error against the exact distance but are biased low, and rank worse (recall 0.93 at a 1,500-row shortlist). The wider the first stripe, the smaller the gap (384 bits: 1.43 and 3.40; 512 bits: 1.01 and 2.59),
+but the bytes saved shrink faster, because 367 MB of the 956 MB is blobs, block rounding, and gap fill that no stripe touches.
+
+### 3. Estimate: a scan that reads exact byte ranges (`c39_ranges.py`, first 60 queries per shape, no format change, estimate only)
+
+Today the scan reads every probed leaf's blob and code range through 256 KiB cache blocks (a third of the bytes at 7.9 percent are rounding and gap fill). Instead, read exact ranges and merge only gaps under G bytes. Latency model: 60 ms to first byte
+(the cold first read, C34 to C36), 2.7 GB/s at the NIC (956 MB in 356 ms, C38), and 512 reads in flight at about 100 MB/s each; a scan is the larger of its bytes over the rate and its read rounds. Today's modeled scan is 412 ms (7.9 percent), 610 ms (0.64 percent), and 132 ms (`text_length`)
+(C38 measured 356 ms for the first). Slab GETs modeled today: 634, 408, and 258 (the trace's 959, 737, and 611 also count row maps, documents, and routing).
+
+| Read set and gap G | 7.9%: MB, GETs, model change | 0.64%: MB, GETs, model change | `text_length`: MB, GETs, model change |
+| --- | --- | --- | --- |
+| Today (256 KiB blocks) | 952, 634, 0 | 1,485, 408, 0 | 195, 258, 0 |
+| Exact leaf ranges, 0 to 4 KiB | 642 MB (0.68x), 1,629, -98 ms | 1,095 (0.74x), 2,851, -145 ms | 100 (0.51x), 429, -10 ms |
+| Exact leaf ranges, 16 KiB | 643, 1,602, -98 ms | 1,095, 2,802, -145 ms | 100, 427, -10 ms |
+| Exact leaf ranges, 64 KiB | 649, 1,450, **-110 ms** | 1,120, 2,212, -135 ms | 101, 410, -10 ms |
+| Exact leaf ranges, 256 KiB | 747, 813, -76 ms | 1,343, 596, -53 ms | 116, 295, -8 ms |
+| Exact leaf ranges, 1 MiB | 1,032, 309, +30 ms | 1,553, 226, +25 ms | 187, 172, -1 ms |
+
+So exact ranges cut bytes by about a third at 7.9 percent and add about 1,000 GETs, for a modeled 100 ms (13 percent of the 750 ms query). The saving needs no format change, but it gives up the cache blocks that warm repeated reads (this test is cold).
+
+### 4. Estimate: read only the blocks that hold a match at 0.64 percent (same dump, estimate only)
+
+At 0.64 percent only 12.6 percent of 32-row blocks hold a matching row. Reading only those blocks (the 4 KiB code block, and the 128-byte slice of each of the four factor arrays) plus every blob:
+
+| Gap G | MB (ratio to today) | GETs | Model change |
+| --- | ---: | ---: | ---: |
+| 0 | 215 (0.14x) | 117,424 | +13,254 ms |
+| 4 KiB | 312 (0.21x) | 27,173 | +2,696 ms |
+| 16 KiB | 421 (0.28x) | 16,262 | +1,378 ms |
+| 64 KiB | 825 (0.56x) | 4,643 | +68 ms |
+| 256 KiB | 1,282 (0.86x) | 725 | -75 ms |
+
+The bytes can fall 7 times, but only with tens of thousands of GETs: matching rows are spread over a leaf's blocks, so a leaf's hit blocks are separate 4 KiB reads, and the model puts that at seconds (512 reads in flight, 60 ms each). Where the GET count is affordable (gap 256 KiB) it saves 75 ms, less than exact whole-leaf ranges at their best (-145 ms at 0 to 16 KiB, section 3). At 7.9 percent the hit-block set is within 3 percent of the whole-leaf set.
+
+### 5. Estimate: probe fewer leaves under a filter (`c39_probes.py`, 200 queries, no format change, estimate only)
+
+A filter scales the probe count about `1/p` (346 to 6,179 leaves at p of 7.9 percent). Keep only the nearest `L = 346 x (1/p)^a` leaves by the query's distance to the leaf center (capped at today's count),
+and rescore with today's rule inside them. Recall is against the exact top 10 of today's probed set (which today's answer equals in every query); "same" counts queries returning exactly today's ten.
+
+| Shape (today) | a | Leaves | MB (ratio) | Recall mean (min) | Same answer |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 7.9% (6,179 leaves, 956 MB) | 0.5 | 1,228 | 241 (3.96x) | 0.9925 (0.8) | 187 |
+| | 0.7 | 2,037 | 383 (2.50x) | 0.993 (0.8) | 187 |
+| | 0.85 | 2,979 | 534 (1.79x) | 0.996 (0.9) | 192 |
+| | 1.0 | 4,356 | 728 (1.31x) | 0.999 (0.9) | 198 |
+| 0.64% (9,335 leaves, 1,485 MB) | 0.5 | 4,313 | 853 (1.74x) | 0.999 (0.9) | 198 |
+| | 0.7 and up | 9,335 | 1,485 (capped at today) | 1.000 | 200 |
+| `text_length >= 300` (963 leaves, 194 MB) | 0.5 | 485 | 102 (1.91x) | 0.9885 (0.8) | 179 |
+| | 0.7 | 556 | 115 (1.69x) | 0.990 (0.8) | 182 |
+| | 0.85 | 615 | 126 (1.54x) | 0.994 (0.9) | 188 |
+| | 1.0 | 681 | 139 (1.39x) | 0.9965 (0.9) | 193 |
+
+Recall does **not** hold at no loss at an `a` of 0.7 or lower: 13 of 200 queries lose one or two of ten at 7.9 percent for 2.5 times fewer bytes (the bandwidth-bound part of the scan falls from about 356 to 142 ms). It is a recall decision for Kyle, not a free exact saving. Today's own recall against the oracle's filtered truth
+is 1.000 (`z`) and 0.989 (`text_length`), so a plan with relative recall 0.99 lands near 0.99 and 0.98 there (no truth exists for the 7.9 percent shape).
+The nearest-first order matters: the lost winners sit in far leaves that a larger `a` recovers (0.9925 to 0.999).
+
+### Not built
+
+No format version, stripe writer, or reader change; no engine change (`ann_dir.rs` and `index.rs` carry no hook at the commit). `c39_hook.patch` is the dump hook for reproducing (apply on v0.1.79, and run `c39_dump.py`); `c39_sim.py`, `c39_split.py`, `c39_ranges.py`, and `c39_probes.py` read its dumps.
+
+### Cost
+
+One c7gn.4xlarge on demand for about 1.2 hours (about $1.0), plus the 77 GB server-side copy (deleted): about $1.1 in all. The instance, key pair, security group, and the S3 prefix `tmp/c39` are deleted (no multipart uploads).
+
 ## Round G24: multi-entry beam seeding and a raw-text query parse (M4): neither is shipped, 1.03 times at `top_k` 10 for 0.003 of recall
 
 **Setup:** Round G23's: the Apple M4 (shared Mac mini, 10 cores), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), the frozen v0.1.19 fixture, release binaries, indexing off, the graph promoted the ordinary way (`g15_promote.py`), IDs only, the native driver (`native_drive`, 16 connections, 20 seconds per arm). Every pair of arms ran on **one promoted server** of a candidate binary with a temporary switch file (read every 250 ms, not in the tree). The effort controller settled at `ef` 64 on the first server and 80 on the second, so compare arms within a server only. Both candidates were reverted before this commit: the tree's code is main's (a3f1606), and the candidate commits stay in the branch history (031f5e5 for the parse, 7c9d535 and 63eb2f5 for the seeding).
