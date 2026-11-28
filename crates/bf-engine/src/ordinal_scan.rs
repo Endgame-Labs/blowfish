@@ -18,7 +18,7 @@ use std::{
 };
 
 /// Rows scored per projected chunk: bounds the documents alive at once.
-pub(crate) const CHUNK: usize = 1 << 15;
+const CHUNK: usize = 1 << 15;
 
 /// True when `rank` only combines BM25 clauses, constants, and numeric attributes, so a row's score
 /// is a function of its clause scores and attribute values alone.

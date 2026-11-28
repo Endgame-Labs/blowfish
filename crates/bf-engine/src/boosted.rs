@@ -15,7 +15,7 @@
 //! the ordinal scorer answers it.
 use crate::{
     NamespaceState,
-    ordinal_scan::{CHUNK, Contender, offer},
+    ordinal_scan::{Contender, offer},
     segment,
     sum_text::{self, Scores},
 };
@@ -122,7 +122,6 @@ async fn maxima(
     seg: &bf_wal::Segment,
     attribute: &str,
 ) -> Result<Arc<WindowMaxima>, ApiError> {
-    let unusable = || Arc::new(WindowMaxima(None));
     if !matches!(
         state
             .schema
@@ -132,10 +131,10 @@ async fn maxima(
             ScalarType::Int | ScalarType::Uint | ScalarType::Float
         ))
     ) {
-        return Ok(unusable());
+        return Ok(Arc::new(WindowMaxima(None)));
     }
     let Some(docs) = seg.files.get("docs") else {
-        return Ok(unusable());
+        return Ok(Arc::new(WindowMaxima(None)));
     };
     let rows = seg.row_count as usize;
     let windows = rows.div_ceil(bf_text::WINDOW);
@@ -144,25 +143,19 @@ async fn maxima(
     if let Some(found) = crate::read_cache::get::<WindowMaxima>(&key, bytes) {
         return Ok(found);
     }
-    let columns = std::collections::BTreeSet::from([attribute.to_string()]);
+    // A column that would take more than an eighth of the read cache would evict what other queries
+    // share, and could not stay resident: the ordinal scorer answers such a segment.
+    if bytes > crate::read_cache::capacity() / MAX_CACHE_SHARE {
+        return Ok(Arc::new(WindowMaxima(None)));
+    }
+    let unusable = || crate::read_cache::insert(&key, bytes, WindowMaxima(None));
+    let Some(values) = segment::numeric_column(store, seg, attribute).await? else {
+        return Ok(unusable());
+    };
     let mut best = vec![f64::NEG_INFINITY; windows];
-    let mut values = Vec::with_capacity(rows);
-    for start in (0..rows).step_by(CHUNK) {
-        let end = (start + CHUNK).min(rows);
-        let wanted = RoaringBitmap::from_iter(start as u32..end as u32);
-        let docs = segment::projected_rows(store, seg, &wanted, Some(&columns)).await?;
-        for row in start..end {
-            let Some(v) = docs
-                .get(&(row as u32))
-                .and_then(|d| d.get(attribute))
-                .and_then(serde_json::Value::as_f64)
-            else {
-                return Ok(crate::read_cache::insert(&key, bytes, WindowMaxima(None)));
-            };
-            values.push(v);
-            let w = &mut best[row / bf_text::WINDOW];
-            *w = w.max(v);
-        }
+    for (row, &v) in values.iter().enumerate() {
+        let w = &mut best[row / bf_text::WINDOW];
+        *w = w.max(v);
     }
     Ok(crate::read_cache::insert(
         &key,
@@ -180,6 +173,8 @@ pub(crate) struct Selection {
     pub hits: Vec<bf_text::SearchHit>,
 }
 
+/// A segment's cached values may take at most `1 / MAX_CACHE_SHARE` of the read cache.
+const MAX_CACHE_SHARE: u64 = 8;
 /// Windows in the first batch; each later batch is four times larger, up to `MAX_BATCH`.
 const FIRST_BATCH: usize = 16;
 const MAX_BATCH: usize = 512;
