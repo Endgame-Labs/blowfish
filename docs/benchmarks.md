@@ -19588,3 +19588,67 @@ Pass: at least 1.3x at recall at least today's on the 50 and 20 percent filters:
 - Promotion took 37 minutes from start here (graph ready at 15, `ef` 100 accepted after rejecting 64 and 80), about the 19 G26 reported plus the 10-minute dwell.
 - The fixture went to the M4 without each segment's `ann.1.bfa` and the WAL data (about 12.6 GB the tiers do not read); the server started and served normally.
 - Cost: about 27 GB of S3 transfer to this VM and 6 GB to the M4 (about $3). The M4 run directory is deleted.
+
+
+## Round BW31: warm BM25 dense terms past 32 (stopped at the profile: nothing reaches 8 percent)
+
+Neon's idea was that the 32 dense-array slots per segment (`MAX_DENSE_TERMS`) go to whichever frequent terms arrive first, that a
+per-term mutex guards the dense bounds, and that the 64-row non-zero check is a scalar loop. **None of the three is at least 8
+percent of warm 16-client CPU, so no code changed.** An upper-bound run with the cap lifted to 4,096 measured no gain.
+
+### Measurement
+
+Local, this VM (8 vCPU, load 3 to 4 from other workers). v0.1.83 (`92085b4`) `scale-server` release build with debug info, fixture
+`tmp/msmarco-1m-v021/` (eight text segments) copied to local disk per arm, a 2 GiB raw cache, 4,000-byte blocks, server on CPUs 0 to
+5 with two Rayon and two Tokio workers, `concurrent_bm25` on CPUs 6 and 7, the held-out odd-indexed 500 queries eight times per pass
+(every reply checked against truth), two 1-client prewarm passes. `perf record -F 999 --call-graph dwarf` on the server CPUs during
+twelve 16-client passes. Term-occurrence counters were a temporary patch, removed.
+
+### Where the query terms go (exact query terms, summed over the eight segments, after warm-up)
+
+| Path | Occurrences | Share |
+| --- | ---: | ---: |
+| Dense array | 586,155 | 39.9% |
+| Posting memo, df above the sparse threshold, no array | 72,551 | 4.9% |
+| Sparse (df at or below the threshold) | 808,670 | 55.1% |
+
+Of the 72,551 memo occurrences, about 17,000 are the rent period (each term's first use per segment, before the array is earned),
+so **about 55,700 occurrences (3.8% of all) are denied an array** by the cap or the budget. They spread over 35
+terms (by namespace document frequency, in the 60 most-used rows), the biggest with 6,777. The slots are held by the genuinely frequent terms: the eight
+largest by document frequency (550,000 to 870,000 rows, the stopwords) account for about 55% of the dense occurrences, and the rest are
+mid-frequency words (30,000 to 100,000 rows) that real queries do use. Slots do not go to rare terms, because a term must be dense
+(df above the sparse threshold) before it counts.
+
+### Where the CPU goes (16 clients, `bf-query` threads 93% of server samples)
+
+| Item | Share of CPU |
+| --- | ---: |
+| `search_internal` body (everything inlined) | 47% |
+| Dense frequency byte read (`DenseFrequencies::get`, `segment.rs:213`) | 3.0% |
+| Dense candidate loop (the 64-row `values != 0` check) | under 0.5% (no line above 0.44%) |
+| Dense bounds mutex (`bounds`) | not visible: no lock symbol above 0.4% (`Arc` clone atomics 1.2%, shared with other callers) |
+| `Postings::window`, frame decode, and allocation for the memo and sparse paths together | about 8%, and most of it serves the sparse terms |
+| `crc32fast` 2.0%, `select_nth_unstable` 1.5%, `Rows` drop 1.2%, `malloc` and `free` 1.5% | |
+
+The memo path for denied dense terms is a share of that last 8%, itself bounded by the 3.8% of occurrences it serves. The mutex is
+held once per query term per segment for a pointer compare and an `Arc` clone, and the 16-client run is CPU-bound, not contended
+(BW19 measured the same).
+
+### Upper bound: cap lifted to 4,096, everything else equal
+
+A/B/B/A, fresh process and fresh store copy per arm, one build with `MAX_DENSE_TERMS = 4096` (the pool budget still applies) against
+v0.1.83, three 1-client and six 16-client passes per arm:
+
+| Arm | 16-client q/s, mean (median) of 12 passes | 16-client CPU ms/query | 1-client q/s | Peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: |
+| v0.1.83 (two arms) | 2,643 (2,681) | 1.9 to 2.4 | 552 to 652 | 1,072 to 1,095 |
+| Cap 4,096 (two arms) | 2,553 (2,680) | 2.0 to 2.3 | 397 to 622 | 1,120 to 1,128 |
+
+Same median, same CPU per query, RSS up about 50 MiB. The VM's noise (a run's six passes span 15 to 25%) is larger than any effect,
+which is consistent with a ceiling near 1.0x and far below the 1.15x bar. Lifting the cap, admitting by use, eviction, a lock-free
+bounds read, and a vectorized non-zero check would each be a smaller change than that ceiling, so none was built.
+
+### Not measured
+
+Cold (no change to measure), and a memory-capped reader where the pool budget, not the cap, limits the arrays (the 1M fixture's
+segments fit 32 arrays in the 8 MiB floor budget; a much larger segment with a 64 MiB pool is where a budget rule could matter).
