@@ -60,10 +60,10 @@ fn attributes(rank: &RankBy, out: &mut BTreeSet<String>) {
 
 /// One scored row, ordered best first: higher score, then lower ID. A max-heap of these keeps the
 /// worst contender on top.
-struct Contender<'a> {
-    score: f64,
-    id: &'a Id,
-    row: u32,
+pub(crate) struct Contender<'a> {
+    pub score: f64,
+    pub id: &'a Id,
+    pub row: u32,
 }
 impl PartialEq for Contender<'_> {
     fn eq(&self, other: &Self) -> bool {
@@ -84,7 +84,7 @@ impl Ord for Contender<'_> {
             .then(self.id.cmp(other.id))
     }
 }
-fn offer<'a>(heap: &mut BinaryHeap<Contender<'a>>, c: Contender<'a>, cap: usize) {
+pub(crate) fn offer<'a>(heap: &mut BinaryHeap<Contender<'a>>, c: Contender<'a>, cap: usize) {
     if heap.len() < cap {
         heap.push(c);
     } else if heap.peek().is_some_and(|worst| c < *worst) {
@@ -94,7 +94,7 @@ fn offer<'a>(heap: &mut BinaryHeap<Contender<'a>>, c: Contender<'a>, cap: usize)
 }
 
 /// A row's score: a clause is its hit (0 when it has none), everything else is `query::arithmetic`.
-fn score_row(
+pub(crate) fn score_row(
     schema: &Schema,
     doc: &Document,
     rank: &RankBy,

@@ -1538,6 +1538,46 @@ pub(crate) async fn projected_rows_with(
     trace_hydration(trace_start, docs_key, "data", rows.len());
     Ok(docs)
 }
+/// Every row's value of one scalar column as `f64` (the way `Attribute` reads it), or `None` when
+/// the column is missing or some row has no numeric value in it. The blocks are decoded one after
+/// another with no per-row document, and nothing is added to the decoded block cache: a whole
+/// column would evict the blocks other queries share.
+pub(crate) async fn numeric_column(
+    store: &Storage,
+    segment: &Segment,
+    attribute: &str,
+) -> Result<Option<Vec<f64>>, ApiError> {
+    let docs_file = segment.files.get("docs").ok_or_else(corrupt)?;
+    let reader = ObjectReader::new(store, docs_file);
+    let dir = directory(&reader).await?;
+    let Some(col) = dir.columns.get(attribute).filter(|c| c.vector.is_none()) else {
+        return Ok(None);
+    };
+    let rows = segment.row_count as usize;
+    let mut out = Vec::with_capacity(rows);
+    for batch in col.blocks.chunks(64) {
+        let ranges = batch
+            .iter()
+            .map(|b| b.offset..b.offset + b.length)
+            .collect();
+        let data = reader.read_batch(ranges).await.map_err(index_error)?;
+        for (b, data) in batch.iter().zip(data) {
+            if crc32fast::hash(&data) != b.crc {
+                return Err(corrupt());
+            }
+            for value in decode_column(&data, col, b)? {
+                match value.as_ref().and_then(Value::as_f64) {
+                    Some(x) => out.push(x),
+                    None => return Ok(None),
+                }
+            }
+        }
+    }
+    if out.len() != rows {
+        return Err(corrupt());
+    }
+    Ok(Some(out))
+}
 /// Diagnostic boundaries distinguish dependent directory and data waves, including cache hits.
 fn trace_hydration(start: Option<std::time::Instant>, key: &str, phase: &str, rows: u64) {
     if let Some(start) = start {

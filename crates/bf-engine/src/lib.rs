@@ -3,6 +3,7 @@ pub use query_worker::on_query_reactor;
 mod ann;
 mod ann_dir;
 mod auto_recluster;
+mod boosted;
 mod branch;
 mod drain;
 mod filter;
@@ -26,6 +27,7 @@ mod statistics;
 mod stop;
 mod streaming;
 mod sum_text;
+pub use boosted::{BoostOutcomes, boost_outcomes};
 pub use sum_text::{SumOutcomes, sum_outcomes};
 mod tail;
 #[cfg(test)]

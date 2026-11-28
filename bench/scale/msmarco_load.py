@@ -50,6 +50,9 @@ def main():
     p.add_argument("--rows", type=int, default=1_000_000)
     p.add_argument("--batch", type=int, default=5000)
     p.add_argument("--inflight", type=int, default=4)
+    p.add_argument("--attrs", choices=["none", "plain", "filterable"], default="none",
+                   help="add pop (float, 1000*u^4), ts, cat (id%%8), and pr (uint 0..100, uniform) from a hash of the id; "
+                        "'plain' makes them non-filterable, 'filterable' filterable")
     a = p.parse_args()
     url = f"{a.base_url}/v2/namespaces/{a.namespace}"
     pool = ThreadPoolExecutor(a.inflight)
@@ -60,6 +63,10 @@ def main():
             body = {"upsert_rows": batch}
             if first:
                 body["schema"] = {"text": {"type": "string", "full_text_search": True}}
+                if a.attrs != "none":
+                    f = a.attrs == "filterable"
+                    for name, ty in (("pop", "float"), ("ts", "int"), ("cat", "int"), ("pr", "uint")):
+                        body["schema"][name] = {"type": ty, "filterable": f}
             batch = []
             while len(pending) >= a.inflight:
                 pending.pop(0).result()
@@ -68,7 +75,13 @@ def main():
                 pending.pop(0).result()
         for line in lines(dl, a.hub_endpoint):
             d = json.loads(line)
-            batch.append({"id": int(d["docid"]), "text": d["text"]})
+            row = {"id": int(d["docid"]), "text": d["text"]}
+            if a.attrs != "none":
+                h = zlib.crc32(d["docid"].encode()) * 2654435761 % 2**32
+                u = (h ^ (h >> 13)) % 1_000_003 / 1_000_003
+                row.update(pop=1000 * u ** 4, ts=1_600_000_000 + h % 100_000_000, cat=int(d["docid"]) % 8,
+                           pr=zlib.crc32(b"pr" + d["docid"].encode()) % 101)
+            batch.append(row)
             nbytes += len(d["text"].encode())
             rows += 1
             if len(batch) == a.batch:

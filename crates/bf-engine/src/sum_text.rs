@@ -292,7 +292,7 @@ fn has_text(x: &RankBy) -> bool {
 }
 
 /// `Saturate` and `Decay` parameters that keep the result in `[0, 1]`.
-fn bounded_params(params: &serde_json::Value) -> Option<(f64, f64)> {
+pub(crate) fn bounded_params(params: &serde_json::Value) -> Option<(f64, f64)> {
     let midpoint = crate::query::parameter(params, "midpoint", 1.0).ok()?;
     let exponent = crate::query::parameter(params, "exponent", 1.0).ok()?;
     (MIDPOINT_RANGE.contains(&midpoint) && EXPONENT_RANGE.contains(&exponent))
@@ -368,7 +368,7 @@ fn inner_columns(x: &RankBy, columns: &mut std::collections::BTreeSet<String>) -
 /// (as `Attribute` reads it: a missing or non-numeric value is 0): constants, `Attribute`,
 /// non-negative constant `Product`s, and `Sum`, `Max`, and `Saturate` of such terms. `None` when the
 /// term reads no attribute, reads two, or is not monotone (`Dist`, `Decay`, a predicate).
-fn monotone_attribute(x: &RankBy) -> Option<String> {
+pub(crate) fn monotone_attribute(x: &RankBy) -> Option<String> {
     fn go(x: &RankBy, attr: &mut Option<String>) -> bool {
         match x {
             RankBy::Constant(n) => n.as_f64().is_some_and(f64::is_finite),
