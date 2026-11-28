@@ -1,6 +1,6 @@
 //! Shared data model and turbopuffer wire contract.
 mod ast;
-mod fastvec;
+pub mod fastvec;
 mod schema;
 mod wire;
 pub use ast::*;

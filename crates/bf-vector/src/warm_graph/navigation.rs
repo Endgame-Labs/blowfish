@@ -81,6 +81,19 @@ pub struct Screen<'a> {
     bits: &'a Bits,
     query: &'a [u64],
     margin: u16,
+    early: Option<Early>,
+}
+/// Screening before the beam is full, for a walk seeded near the query: neighbors are dropped
+/// against the beam's tail with a wide margin while the beam holds fewer than `k` nodes, and a
+/// tighter one until it holds `ef`.
+#[derive(Clone, Copy, Debug)]
+pub struct Early {
+    /// Beam size at which the wide margin gives way to the tight one.
+    pub k: usize,
+    /// Margin, in bits, below `k` nodes.
+    pub wide: u16,
+    /// Margin, in bits, from `k` nodes to a full beam.
+    pub tight: u16,
 }
 impl<'a> Screen<'a> {
     /// `query` holds the signs of the rotated query, in the layout of a row of `bits`.
@@ -94,22 +107,47 @@ impl<'a> Screen<'a> {
             bits,
             query,
             margin,
+            early: None,
         }
     }
-    fn skips(&self, tail: u16, h: u16) -> bool {
-        h > tail.saturating_add(self.margin)
+    /// The same screen, active from the first hop under `early`.
+    pub(super) fn with_early(mut self, early: Early) -> Self {
+        self.early = Some(early);
+        self
+    }
+    /// The screen's margin once the beam is full, in bits.
+    pub(super) fn margin(&self) -> u16 {
+        self.margin
+    }
+    fn skips(&self, beam: usize, ef: usize, tail: u16, h: u16) -> bool {
+        let margin = if beam >= ef {
+            self.margin
+        } else {
+            match self.early {
+                None => return false,
+                Some(e) if beam < e.k => e.wide,
+                Some(e) => e.tight,
+            }
+        };
+        h > tail.saturating_add(margin)
     }
 }
 /// Reusable, exact visitation and one sorted beam. Its owner reserves retained capacity.
 pub struct Scratch {
     visited: Visited,
     beam: Vec<BeamHit>,
+    /// Nodes the last search expanded.
+    pub(super) expansions: usize,
+    /// Unscored neighbors the early screen rejected while the beam was short, as (Hamming, id).
+    deferred: Vec<(u16, u32)>,
 }
 impl Scratch {
     pub fn new(n: usize) -> Self {
         Self {
             visited: Visited::new(n),
             beam: Vec::new(),
+            expansions: 0,
+            deferred: Vec::new(),
         }
     }
     /// Mean Hamming distance (rounded up) of the beam's [`TAIL`] worst members.
@@ -130,14 +168,14 @@ impl Scratch {
         ef: usize,
         score: impl FnMut(u32) -> f32,
     ) -> (Vec<Hit>, usize) {
-        self.search_prefetched(links, degrees, entry, ef, score, |_| {}, None)
+        self.search_prefetched(links, degrees, &[entry], ef, score, |_| {}, None)
     }
     #[allow(clippy::too_many_arguments)]
     pub fn search_prefetched(
         &mut self,
         links: &[[u32; 34]],
         degrees: &[u8],
-        entry: u32,
+        entries: &[u32],
         ef: usize,
         score: impl FnMut(u32) -> f32,
         prefetch: impl FnMut(u32),
@@ -149,7 +187,7 @@ impl Scratch {
                 out[..degree].copy_from_slice(&links[id as usize][..degree]);
                 degree
             },
-            entry,
+            entries,
             ef,
             score,
             prefetch,
@@ -167,7 +205,7 @@ impl Scratch {
     pub fn search_with(
         &mut self,
         mut adjacent: impl FnMut(u32, &mut [u32; MAX_LINKS]) -> usize,
-        entry: u32,
+        entries: &[u32],
         ef: usize,
         mut score: impl FnMut(u32) -> f32,
         mut prefetch: impl FnMut(u32),
@@ -176,16 +214,29 @@ impl Scratch {
     ) -> usize {
         self.visited.begin();
         self.beam.clear();
-        self.visited.insert(entry);
-        self.beam.push(BeamHit {
-            hit: Hit {
+        self.expansions = 0;
+        self.deferred.clear();
+        let mut evaluations = 0;
+        for &entry in entries {
+            if !self.visited.insert(entry) {
+                continue;
+            }
+            evaluations += 1;
+            let hit = Hit {
                 id: entry,
                 distance: score(entry),
-            },
-            h: screen.map_or(0, |sc| sc.bits.hamming(sc.query, entry)),
-            expanded: false,
-        });
-        let mut evaluations = 1;
+            };
+            let pos = self.beam.partition_point(|b| b.hit < hit);
+            self.beam.insert(
+                pos,
+                BeamHit {
+                    hit,
+                    h: screen.map_or(0, |sc| sc.bits.hamming(sc.query, entry)),
+                    expanded: false,
+                },
+            );
+        }
+        self.beam.truncate(ef);
         let mut next = 0;
         let mut pending = [0u32; MAX_LINKS];
         loop {
@@ -193,11 +244,41 @@ impl Scratch {
                 next += 1;
             }
             if next == self.beam.len() {
-                break;
+                // The early screen must not leave the beam short of `ef` while nodes remain:
+                // score the nearest rejected neighbors (by Hamming distance) until it is full.
+                if self.beam.len() >= ef || self.deferred.is_empty() {
+                    break;
+                }
+                let mut deferred = std::mem::take(&mut self.deferred);
+                deferred.sort_unstable();
+                for (h, id) in deferred.drain(..) {
+                    if self.beam.len() >= ef {
+                        break;
+                    }
+                    let hit = Hit {
+                        id,
+                        distance: score(id),
+                    };
+                    evaluations += 1;
+                    let pos = self.beam.partition_point(|b| b.hit < hit);
+                    self.beam.insert(
+                        pos,
+                        BeamHit {
+                            hit,
+                            h,
+                            expanded: false,
+                        },
+                    );
+                    next = next.min(pos);
+                }
+                deferred.clear();
+                self.deferred = deferred;
+                continue;
             }
             let current = self.beam[next].hit;
             self.beam[next].expanded = true;
             next += 1;
+            self.expansions += 1;
             expanded(current);
             // Every unseen neighbor is scored before selecting another expansion. Collecting
             // that same ordered batch lets future code rows arrive while scoring this one.
@@ -223,20 +304,23 @@ impl Scratch {
                 }
             }
             let mut tail = self.tail_hamming();
-            let rejected = |beam_full: bool, tail: u16, h: u16| {
-                beam_full && screen.is_some_and(|screen| screen.skips(tail, h))
+            let rejected = |beam: usize, tail: u16, h: u16| {
+                screen.is_some_and(|screen| screen.skips(beam, ef, tail, h))
             };
             let (mut ahead, mut issued) = (0, 0);
             for position in 0..pending.len() {
                 while issued < position + 3 && ahead < pending.len() {
-                    if !rejected(self.beam.len() >= ef, tail, hamming[ahead]) {
+                    if !rejected(self.beam.len(), tail, hamming[ahead]) {
                         prefetch(pending[ahead]);
                         issued += 1;
                     }
                     ahead += 1;
                 }
                 let (id, h) = (pending[position], hamming[position]);
-                if rejected(self.beam.len() >= ef, tail, h) {
+                if rejected(self.beam.len(), tail, h) {
+                    if self.beam.len() < ef {
+                        self.deferred.push((h, id));
+                    }
                     continue;
                 }
                 let hit = Hit {
@@ -376,7 +460,7 @@ mod tests {
                 let a = actual.search_prefetched(
                     &links,
                     &degrees,
-                    entry,
+                    &[entry],
                     ef,
                     |id| {
                         va.push(id);
@@ -425,13 +509,13 @@ mod tests {
             let a = screened.search_prefetched(
                 &links,
                 &degrees,
-                entry,
+                &[entry],
                 32,
                 score,
                 |_| {},
                 Some(screen),
             );
-            let b = plain.search_prefetched(&links, &degrees, entry, 32, score, |_| {}, None);
+            let b = plain.search_prefetched(&links, &degrees, &[entry], 32, score, |_| {}, None);
             // A screen that never rejects is the plain walk.
             assert_eq!(a, b, "pass {pass}");
             let screen = Screen::new(&bits, &query);
@@ -439,7 +523,7 @@ mod tests {
             let c = screened.search_prefetched(
                 &links,
                 &degrees,
-                entry,
+                &[entry],
                 32,
                 score,
                 |_| {},

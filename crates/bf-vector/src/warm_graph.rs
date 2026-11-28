@@ -37,7 +37,10 @@ pub struct HotGraph {
     rows: Vec<u32>,
     links: Vec<[u32; 34]>,
     degrees: Vec<u8>,
+    /// The global medoid, then the coarse regions' medoids.
     entries: Vec<u32>,
+    /// The one-bit codes of `entries`, packed back to back.
+    entry_bits: Vec<u64>,
     codes: quant::Codes,
     norms: Vec<crate::CosineNorm>,
     /// Graph node of each tier row (`u32::MAX` where the tier row is not a node), or empty when
@@ -48,6 +51,12 @@ pub struct HotGraph {
 }
 /// Reusable per-query exact visitation and bounded beam.
 pub struct HotScratch(navigation::Scratch);
+impl HotScratch {
+    /// Nodes the last walk expanded.
+    pub fn expansions(&self) -> usize {
+        self.0.expansions
+    }
+}
 impl HotGraph {
     /// Number of graph nodes.
     pub fn len(&self) -> usize {
@@ -67,6 +76,7 @@ impl HotGraph {
             + self.links.capacity() * 136
             + self.degrees.capacity()
             + self.entries.capacity() * 4
+            + self.entry_bits.capacity() * 8
             + self.codes.values.capacity()
             + self.codes.scales.capacity() * 4
             + self.norms.capacity() * 4
@@ -274,6 +284,18 @@ impl HotGraph {
         live: Option<&RoaringBitmap>,
         scratch: &mut HotScratch,
     ) -> Result<(Vec<(u32, crate::CosineNorm)>, usize)> {
+        self.candidates_with_options(query, ef, count, live, scratch, None)
+    }
+    /// [`Self::candidates_with_norms`] with explicit walk options (`None` is production's).
+    pub fn candidates_with_options(
+        &self,
+        query: &[f32],
+        ef: usize,
+        count: usize,
+        live: Option<&RoaringBitmap>,
+        scratch: &mut HotScratch,
+        options: Option<WalkOptions>,
+    ) -> Result<(Vec<(u32, crate::CosineNorm)>, usize)> {
         crate::distance::validate(query, self.dims)?;
         if ef == 0 || count == 0 || query.iter().all(|x| *x == 0.) {
             return Err(Error::InvalidInput("unsupported graph query shape".into()));
@@ -282,18 +304,33 @@ impl HotGraph {
         let rotated = rabitq::RaBitQ::new(q.len(), 42)?.rotate(&q);
         let (code, scale) = quant::encode(&rotated);
         let signs = self.bits.query(&rotated);
-        let screen = navigation::Screen::new(&self.bits, &signs);
-        let entry = self
-            .entries
-            .iter()
-            .map(|&id| (id, self.codes.score(&code, scale, id)))
-            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
-            .unwrap()
-            .0;
+        let walk = options.unwrap_or_else(WalkOptions::production);
+        let mut screen = navigation::Screen::new(&self.bits, &signs);
+        let margin = screen.margin();
+        if walk.full != 1. {
+            screen = navigation::Screen::with_margin(
+                &self.bits,
+                &signs,
+                (f32::from(margin) * walk.full).ceil() as u16,
+            );
+        }
+        let seeds = if walk.seeds == 0 || self.entries.len() < 2 {
+            // The global medoid alone: the walk before multi-entry seeding.
+            vec![self.entries[0]]
+        } else {
+            self.nearest_entries(&signs, walk.seeds)
+        };
+        if walk.seeds > 0 {
+            screen = screen.with_early(navigation::Early {
+                k: count,
+                wide: (f32::from(margin) * walk.wide).ceil() as u16,
+                tight: (f32::from(margin) * walk.tight).ceil() as u16,
+            });
+        }
         let (mut hits, evaluations) = scratch.0.search_prefetched(
             &self.links,
             &self.degrees,
-            entry,
+            &seeds,
             ef.max(count).min(self.len()),
             |id| self.codes.score(&code, scale, id),
             |id| self.codes.prefetch(id),
@@ -305,8 +342,57 @@ impl HotGraph {
             hits.into_iter()
                 .map(|h| (self.rows[h.id as usize], self.norms[h.id as usize]))
                 .collect(),
-            evaluations + self.entries.len(),
+            evaluations,
         ))
+    }
+    /// The `seeds` entries whose one-bit codes are nearest a query's signs: one popcount pass
+    /// over the contiguous entry codes.
+    fn nearest_entries(&self, signs: &[u64], seeds: usize) -> Vec<u32> {
+        let per = self.bits.per();
+        let mut ranked = self
+            .entry_bits
+            .chunks_exact(per)
+            .zip(&self.entries)
+            .map(|(row, &id)| (binary::hamming(signs, row), id))
+            .collect::<Vec<_>>();
+        let seeds = seeds.min(ranked.len());
+        ranked.select_nth_unstable(seeds - 1);
+        ranked.truncate(seeds);
+        ranked.sort_unstable();
+        ranked.into_iter().map(|(_, id)| id).collect()
+    }
+}
+/// How a walk starts and screens before its beam is full.
+#[derive(Clone, Copy, Debug)]
+pub struct WalkOptions {
+    /// Nearest region medoids that seed the beam (0 starts from the global medoid alone).
+    pub seeds: usize,
+    /// Margin before the beam holds `count` nodes, in multiples of the full-beam margin.
+    pub wide: f32,
+    /// Margin from `count` nodes to a full beam, in multiples of the full-beam margin.
+    pub tight: f32,
+    /// Margin of a full beam, in multiples of the usual one.
+    pub full: f32,
+}
+/// TEMPORARY (Round G24 A/B): bit 1 walks from the global medoid alone.
+pub static G24_SWITCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+impl WalkOptions {
+    /// What serving uses.
+    pub fn production() -> Self {
+        if G24_SWITCH.load(std::sync::atomic::Ordering::Relaxed) & 1 != 0 {
+            return Self {
+                seeds: 0,
+                wide: 2.,
+                tight: 1.5,
+                full: 1.,
+            };
+        }
+        Self {
+            seeds: 4,
+            wide: 0.5,
+            tight: 0.5,
+            full: 0.5,
+        }
     }
 }
 /// A cancellation flag usable by source streaming and CPU construction alike.
@@ -413,6 +499,87 @@ mod tests {
         }
 
         assert!(graph.resident_bytes() < HotGraph::reservation(n, dims, 2).unwrap());
+    }
+    /// A graph big enough for region medoids: seeding from the nearest four finds what a walk from
+    /// the global medoid finds, with no more scores.
+    #[test]
+    fn region_seeded_walks_match_the_single_entry_walk() {
+        let (dims, n, clusters) = (32, 5000, 20);
+        let mut seed = 0x1234_5678_9ABC_DEF1u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / 16777216. * 2. - 1.
+        };
+        let centers = (0..clusters)
+            .map(|_| (0..dims).map(|_| next() * 3.).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let source = (0..n)
+            .map(|i| {
+                centers[i % clusters]
+                    .iter()
+                    .map(|c| c + next() * 0.5)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut b = HotGraphBuilder::new(dims, n).unwrap();
+        let packed = source
+            .iter()
+            .flatten()
+            .flat_map(|x| f16::from_f32(*x).to_le_bytes())
+            .collect::<Vec<_>>();
+        b.append(&(0..n as u32).collect::<Vec<_>>(), &packed, &|| false)
+            .unwrap();
+        let graph = b.finish(&|| false).unwrap();
+        assert!(graph.entries.len() > 8, "{} entries", graph.entries.len());
+        let mut sorted = graph.entries.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), graph.entries.len(), "entries are distinct");
+        assert!(graph.entries.iter().all(|&e| (e as usize) < n));
+        let (mut scratch, mut found, mut found_old, mut scored, mut scored_old) =
+            (graph.scratch(), 0, 0, 0, 0);
+        let old = WalkOptions {
+            seeds: 0,
+            wide: 2.,
+            tight: 1.5,
+            full: 1.,
+        };
+        for q in (0..200).map(|i| &source[(i * 23) % n]) {
+            let unit = vectors::normalized(q);
+            let mut truth = (0..n)
+                .map(|i| {
+                    let d = vectors::normalized(&source[i])
+                        .iter()
+                        .zip(&unit)
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>();
+                    (-d, i as u32)
+                })
+                .collect::<Vec<_>>();
+            truth.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let truth = truth.iter().take(10).map(|t| t.1).collect::<Vec<_>>();
+            let (hits, evals) = graph
+                .candidates_with_options(q, 64, 30, None, &mut scratch, None)
+                .unwrap();
+            found += hits.iter().filter(|h| truth.contains(&h.0)).count();
+            scored += evals;
+            let (hits, evals) = graph
+                .candidates_with_options(q, 64, 30, None, &mut scratch, Some(old))
+                .unwrap();
+            found_old += hits.iter().filter(|h| truth.contains(&h.0)).count();
+            scored_old += evals;
+        }
+        assert!(
+            found_old > 1500,
+            "the old walk finds its neighbors: {found_old}"
+        );
+        assert!(
+            found + 20 >= found_old,
+            "seeded {found} against {found_old}"
+        );
+        assert!(scored <= scored_old, "scored {scored} against {scored_old}");
     }
     #[test]
     fn scan_scores_only_allowed_rows_and_matches_a_brute_force_order() {
@@ -608,23 +775,27 @@ mod tests {
                 .collect::<Vec<_>>();
             truth.sort_by(|a, b| a.0.total_cmp(&b.0));
             let truth = truth.iter().take(10).map(|t| t.1).collect::<Vec<_>>();
-            let (hits, evaluations) = graph.candidates(q, ef, 30, None, &mut scratch).unwrap();
+            // The one-bit screen of a full beam alone: the walk before multi-entry seeding.
+            let old = WalkOptions {
+                seeds: 0,
+                wide: 2.,
+                tight: 1.5,
+                full: 1.,
+            };
+            let (hits, evaluations) = graph
+                .candidates_with_options(q, ef, 30, None, &mut scratch, Some(old))
+                .unwrap();
+            let hits = hits.into_iter().map(|h| h.0).collect::<Vec<_>>();
             found += hits.iter().filter(|h| truth.contains(h)).count();
             scored += evaluations;
             // The same walk with no screen: the previous navigation path.
             let rotated = rabitq::RaBitQ::new(dims, 42).unwrap().rotate(&qn);
             let (code, scale) = quant::encode(&rotated);
-            let entry = graph
-                .entries
-                .iter()
-                .map(|&id| (id, graph.codes.score(&code, scale, id)))
-                .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
-                .unwrap()
-                .0;
+            let entry = graph.entries[0];
             let (hits, evaluations) = plain.0.search_prefetched(
                 &graph.links,
                 &graph.degrees,
-                entry,
+                &[entry],
                 ef,
                 |id| graph.codes.score(&code, scale, id),
                 |id| graph.codes.prefetch(id),

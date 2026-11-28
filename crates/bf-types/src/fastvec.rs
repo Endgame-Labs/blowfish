@@ -10,6 +10,8 @@
 //! a power of ten beyond `1e308`, a result that overflows) makes [`parse`] answer `None`, and the
 //! caller reads the same text with `serde_json` as before.
 use std::sync::OnceLock;
+/// TEMPORARY (Round G24 A/B): bit 2 reads vectors the old way.
+pub static G24_SWITCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// `1e0` through `1e308`, as `serde_json` tabulates them: `str::parse` rounds correctly, as a
 /// literal does.
@@ -20,7 +22,10 @@ fn pow10() -> &'static [f64; 309] {
 
 /// The elements of `text`, a JSON array of plain numbers, as `f32` (through `f64`, as
 /// `decode_vector` reads them). `None` if `text` is anything else or a number needs `serde_json`.
-pub(crate) fn parse(text: &str) -> Option<Vec<f32>> {
+pub fn parse(text: &str) -> Option<Vec<f32>> {
+    if G24_SWITCH.load(std::sync::atomic::Ordering::Relaxed) & 2 != 0 {
+        return None;
+    }
     let bytes = text.as_bytes();
     let mut i = skip(bytes, 0);
     if bytes.get(i) != Some(&b'[') {

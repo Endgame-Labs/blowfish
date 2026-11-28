@@ -184,7 +184,7 @@ pub fn build(
                         out[..row.len()].copy_from_slice(row);
                         row.len()
                     },
-                    entry,
+                    &[entry],
                     BEAM,
                     |id| bits.distance(own, id),
                     |id| bits.prefetch(id),
