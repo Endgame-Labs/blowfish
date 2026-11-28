@@ -1381,3 +1381,54 @@ fn boolean_filters_match_the_document_matcher_for_punctuated_terms() {
         assert!(checked > 400, "{checked}");
     }
 }
+
+#[test]
+fn cold_wide_first_batch_matches_reference_for_every_shape() {
+    // Many windows, long terms, and varied lengths and frequencies give the bounds a spread, so a cold
+    // search widens its first posting batch while a warm repeat keeps the default. Both must match.
+    let params = FtsParams::default();
+    let docs: Vec<_> = (0..60_000u32)
+        .map(|row| {
+            let mut text = String::from("filler");
+            for _ in 0..(row * 7 % 13) {
+                text.push_str(" pad");
+            }
+            if row % 3 == 0 {
+                text.push_str(" alpha");
+            }
+            if row % 7 == 0 {
+                text.push_str(" beta beta");
+            }
+            if row % 101 == 0 {
+                text.push_str(" gamma");
+            }
+            if row % 997 < 3 {
+                text.push_str(" delta delta delta");
+            }
+            tokenize(&text, &params)
+        })
+        .collect();
+    let bytes = build(&docs, false, params.tokenizer);
+    let stats = CorpusStats::from_documents(&docs);
+    let masked: RoaringBitmap = (0..docs.len() as u32).filter(|row| row % 11 < 4).collect();
+    for text in [
+        "alpha beta",
+        "alpha beta gamma",
+        "beta delta",
+        "alpha gamma delta filler",
+    ] {
+        let query = Query::new(tokenize(text, &params), false);
+        for k in [1, 10, 100] {
+            for filter in [None, Some(&masked)] {
+                let reader = open(bytes.clone());
+                let want = expected(&docs, &query, &stats, &params, k, filter);
+                for _ in 0..2 {
+                    let got =
+                        block_on(reader.search_prefetched(&query, &stats, &params, k, filter))
+                            .unwrap();
+                    assert_hits(&got, &want);
+                }
+            }
+        }
+    }
+}

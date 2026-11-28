@@ -402,6 +402,13 @@ const MEMO_TERMS: usize = 16384;
 const TAIL: u64 = 64 * 1024;
 /// Windows whose posting blocks a prefetching search reads in its first batch.
 const FIRST_WINDOWS: usize = 24;
+/// A cold prefetching search widens its first posting batch to every window whose bound is at
+/// least this fraction of the segment's best window bound. The top-k floor that the first
+/// windows establish is typically half of that best bound, so the wide batch usually covers every
+/// window the floor leaves competitive and the refinement wave (still the exact fallback) is empty.
+const WIDE_FIRST_BOUND: f64 = 0.4;
+/// Most posting bytes (estimated from block sizes) that the widened first batch may add.
+const WIDE_FIRST_BYTES: u64 = 4 << 20;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(ErrorKind::InvalidData, message)
@@ -2733,7 +2740,11 @@ impl SegmentReader {
                 .collect(),
         );
         let mut next = 0;
-        let mut batch_size = if prefetch { FIRST_WINDOWS } else { usize::MAX };
+        let mut batch_size = if prefetch {
+            self.first_windows(&terms, &mut order)
+        } else {
+            usize::MAX
+        };
         let mut by_bound = Vec::with_capacity(terms.len());
         let mut essential = vec![true; terms.len()];
         let mut dense_candidates = Vec::with_capacity(32);
@@ -3018,6 +3029,53 @@ impl SegmentReader {
         let mut hits: Vec<_> = heap.into_iter().map(|r| r.0).collect();
         hits.sort_unstable_by(|a, b| b.cmp(a));
         Ok((hits, metrics))
+    }
+
+    /// Windows in a prefetching search's first posting batch. A warm search (every block of the
+    /// default first windows is decoded already) keeps `FIRST_WINDOWS`. A cold one reads wider,
+    /// because each later batch costs a full storage round trip while the extra blocks of one
+    /// parallel batch cost almost nothing: see `WIDE_FIRST_BOUND`. Results do not depend on the
+    /// choice, since whatever the floor leaves competitive is still fetched afterwards.
+    fn first_windows(&self, terms: &[SearchTerm], order: &mut Ranked) -> usize {
+        let best = order.items.iter().map(|item| item.1).fold(0.0, f64::max);
+        let wide = order
+            .items
+            .iter()
+            .filter(|item| item.1 >= WIDE_FIRST_BOUND * best)
+            .count();
+        if wide <= FIRST_WINDOWS {
+            return FIRST_WINDOWS;
+        }
+        let narrow: Vec<usize> = (0..FIRST_WINDOWS.min(order.len()))
+            .map(|i| order.get(i).0)
+            .collect();
+        let cold = {
+            let mut memo = self.decoded.lock().unwrap();
+            narrow.iter().any(|&window| {
+                terms
+                    .iter()
+                    .filter(|term| term.dense.is_none() && !term.small)
+                    .any(|term| {
+                        term.span(window).any(|b| {
+                            term.postings[b].is_none()
+                                && memo.get(term.meta.blocks[b].offset).is_none()
+                        })
+                    })
+            })
+        };
+        if !cold {
+            return FIRST_WINDOWS;
+        }
+        let windows = (self.num_docs() as usize).div_ceil(BLOCK).max(1) as u64;
+        let bytes: u64 = terms
+            .iter()
+            .filter(|term| term.dense.is_none() && !term.small)
+            .flat_map(|term| &term.meta.blocks)
+            .map(|b| u64::from(b.size))
+            .sum();
+        let per_window = (bytes / windows).max(1);
+        wide.min((WIDE_FIRST_BYTES / per_window) as usize)
+            .max(FIRST_WINDOWS)
     }
 
     /// Score a highly selective mask directly: look up each query term's frequency at the allowed
