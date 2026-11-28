@@ -4,6 +4,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.86] - 2026-11-28
+
 ### Changed
 
 - **Attribute-boosted BM25 is 7 to 19 times faster warm and 3 to 4 times faster cold when the attribute has no filter dictionary:** `Sum(BM25, weight * attribute)` (a non-negative weight, `Max`, `Saturate`) over a numeric attribute with `filterable: false` used to project the attribute for every row (175 to 200 ms on 1M rows). It now reads the column once per segment into the read cache (8 MB per million rows) and opens only the 128-row text windows whose bound (text bound plus the boost at the window's maximum) can still reach the `k`th total. Answers and scores are identical on all 4,800 measured queries; plain BM25 is unchanged. No setting and no format change.
@@ -623,7 +625,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.85...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.86...HEAD
+[0.1.86]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.86
 [0.1.85]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.85
 [0.1.84]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.84
 [0.1.83]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.83
