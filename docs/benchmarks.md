@@ -18880,3 +18880,57 @@ chain from a `cold_ab.py` run) and `c38_pairs.sh` (the paired runs).
 
 One c7gn.4xlarge on demand from 01:58 to 02:49 UTC (0.85 hours): about $1.2, under the $6 cap. The instance, key pair, security group, and the S3 prefix (693 objects, 77 GB) are deleted, with no
 multipart uploads left.
+
+## Round G24: multi-entry beam seeding and a raw-text query parse (M4): neither is shipped, 1.03 times at `top_k` 10 for 0.003 of recall
+
+**Setup:** Round G23's: the Apple M4 (shared Mac mini, 10 cores), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), the frozen v0.1.19 fixture, release binaries, indexing off, the graph promoted the ordinary way (`g15_promote.py`), IDs only, the native driver (`native_drive`, 16 connections, 20 seconds per arm). Every pair of arms ran on **one promoted server** of a candidate binary with a temporary switch file (read every 250 ms, not in the tree). The effort controller settled at `ef` 64 on the first server and 80 on the second, so compare arms within a server only. Both candidates were reverted before this commit: the tree's code is main's (a3f1606), and the candidate commits stay in the branch history (031f5e5 for the parse, 7c9d535 and 63eb2f5 for the seeding).
+
+### 1. Profile (main's walk and parse, `top_k` 10, `ef` 64, 22,300 q/s, 414 us of server CPU per query, recall 0.9467)
+
+Busy `sample` of the server (8 seconds, 11,637 busy samples): the walk (`search_prefetched`: screen, visited set, beam) 25 percent; the SQ8 dot 15; JSON number parse about 11; rerank futures 7; prep (RaBitQ transform, query signs, normalize, f16 extend) 5; `writev` 5; `memmove` and `memset` 5; CRC32 of the rerank rows 4; everything else 15. `swtch_pri` is down to 1,152 of all samples, so G23's yield spin is gone.
+Walk counts per query on the full NQ graph (offline, same build code, 8 threads): at `ef` 125, **136 expansions and 1,160 SQ8 scores**, recall of the 30-row shortlist 0.9729; at `ef` 64, 76 expansions and 587 scores (0.9516); at `ef` 256 with a 150-row shortlist, 266 expansions and 1,552 scores (0.9842). **Expansions follow `ef`**, so a better start can trim them by about 7 percent at most; the lever is scores.
+
+### 2. Multi-entry seeding (Neon 21:25 #1, Sol 21:25 #1)
+
+Built in `bf-vector`: about 256 region medoids (k-modes over the one-bit codes of a 65,536-row sample, six passes, each medoid the sample row nearest its region's majority code; 32 KiB of codes kept contiguous), one popcount pass per query, the 4 nearest seeding the beam. An early screen (one-bit neighbor screen from hop 1, with a margin that tightens once the beam holds `count` rows) was built too, with a rule that scores the nearest rejected neighbors if a walk would otherwise end short of `ef`.
+
+Offline, matched `ef` (scores per query, recall of the shortlist, single-thread walk time on this VM while other jobs ran, so times are noisy):
+
+| `ef` / shortlist | walk | scores | recall | walk time |
+|---:|---|---:|---:|---:|
+| 125 / 30 | main (one medoid) | 1,160 | 0.9729 | 677 us |
+| 125 / 30 | 4 seeds, early screen at the full-beam margin | 1,000 | 0.9752 | 538 us |
+| 125 / 30 | 4 seeds, early and full margin halved | 759 | 0.9746 | 490 us |
+| 64 / 30 | main | 587 | 0.9516 | 525 us |
+| 64 / 30 | 4 seeds, no early screen | 440 | 0.9582 | 464 us |
+| 64 / 30 | 4 seeds, early screen at the full margin | 423 | 0.9499 | 432 us |
+| 64 / 30 | 4 seeds, margins halved | 297 | 0.9488 | 321 us |
+| 256 / 150 | main | 1,552 | 0.9842 | 1,335 us |
+| 256 / 150 | 4 seeds, no early screen | 1,388 (8 seeds) | 0.9861 | 1,199 us |
+
+The early screen costs recall at low `ef` (0.0066 at `ef` 64 against seeds alone), and halving the margins fails the engine's deep-page test (the page shares 37 of 40 rows with the control, against 38 required), so the second candidate was **seeds only**: 25 percent fewer scores at `ef` 64 with a better shortlist. Seeds 2, 4, 8, and 16 are within 0.001 of each other.
+
+On the M4, paired on one promoted server (`ef` 80, seeds only against main; alternating arms, medians; switch bit 1 was the seeding):
+
+| `top_k` | arm | q/s (runs) | median | server CPU per query | p50 / p99 (ms) | recall |
+|---:|---|---|---:|---:|---|---:|
+| 10 | main | 21,635; 21,620; 21,559; 21,641; 21,611 | **21,620** | 427 us | 0.66 / 1.54 | 0.9568 |
+| 10 | 4 seeds | 22,195; 22,262; 22,274; 22,226; 22,237 | **22,237** (**1.029x**) | 414 us | 0.65 / 1.52 | 0.9535 |
+| 100 | main | 10,691; 10,704; 10,728; 10,687; 10,226 | **10,691** | 853 us | 1.31 / 3.05 | 0.9548 |
+| 100 | 4 seeds | 11,105; 11,104; 11,118; 11,138; 11,161 | **11,118** (**1.040x**) | 818 us | 1.26 / 2.97 | 0.9546 |
+
+The first candidate (early screen with halved margins, first promoted server at `ef` 64) gave 22,340 to 23,160 q/s at `top_k` 10 (1.037x, recall 0.9467 to 0.9433) and 11,060 to 12,400 at `top_k` 100 (1.12x, recall 0.9550 to 0.9500).
+
+**Failed the bar:** `top_k` 10 is 1.03 times (bar 1.15), and recall at `top_k` 10 is 0.0033 lower (bar 0.001) on the real server, even though the offline shortlist recall rose. I did not find the reason for that difference (the server's graph is built in tier-row order and its node IDs differ from the offline build's corpus order, which moves the region medoids). The walk is only a quarter of a query's CPU, so even a free walk could not give 1.15 times: 10 percent fewer SQ8 scores bought about 3 percent of CPU.
+
+### 3. Raw-text query vector parse
+
+Built in `bf-types`: the vector's raw JSON text goes to a reader that follows `serde_json`'s own number rule exactly (a `u64` significand of up to 18 digits, `significand as f64` times or divided by an exact power of ten, then `as f32`, with eight digits at a time), and anything it cannot restate exactly (19 or more digits, an exponent beyond 999, a result that overflows) goes back to `serde_json`. Tests compared every edge case (`1e-45`, `-0.0`, subnormals, 17-digit inputs, exponents, and integers) and 200,000 random `f32` values in five text forms, bit for bit, plus the existing rank-by reader test. The catch: `serde_json` must scan the array once to hand back its raw text, so each number is read twice. A 1,024-d request took 62 us against main's 64 us on this VM (51 against 70 in a second run with the digit loop), and on the M4 the paired arm that kept main's walk and turned the new parse on ran **21,414 q/s against 21,620** (0.99x, within noise, and not faster). Reading the vector without the scan needs a custom deserializer in front of `serde_json`, which this round did not build.
+
+### 4. Not done and notes
+
+- The idea of a second-hop reserve (Sol 00:25 #1) was optional and not started.
+- A single walk at `ef` 64 expands 76 nodes and scores 587; the controller picks `ef` from sampled recall, so a recall gain from seeding would normally turn into a lower `ef` later, which this paired design does not credit.
+- The whole-workspace debug `cargo test` had `a_delta_builds_beside_a_base_rebuild_and_the_base_keeps_it` fail once under load and pass alone, as G23 saw for another test.
+
+Cleanup: the M4 run directory (fixture, store, binaries; about 27 GB) is deleted and nothing of mine is running there; the fixture was fetched through this VM (about $2.4 of S3 transfer); no EC2; no bucket writes; `.scratch/g24` removed.
