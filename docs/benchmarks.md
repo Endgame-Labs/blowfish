@@ -18601,3 +18601,91 @@ attribute with a popularity boost and two clauses, and every shape again under `
 Cold reads, EC2, and a 16-client baseline (it passes 3 GB at 2 clients) were not measured. The ordinal scorer still reads the group
 column of every matching row for `limit.per`, so that shape is 13 to 16 times faster, not hundreds. A stream needs a `filterable`
 numeric attribute; without it a bare `Attribute` takes the ordinal scorer (about 100 to 150 ms on this fixture).
+
+## Round C36: generation-0 segments read no live set (61 fewer GETs on filtered cold queries, 0.98 to 0.89 times the latency, below the 1.15 bar), and S3 warms about 1 MB past a read
+
+A segment at live generation 0 has every row live (its own build wrote the full range, and `ann_dir.rs` already relied on that), so `segment::live` now builds the set locally and
+`snapshot::warm` skips fetching it. For later generations, `filter_live` loads the set while the filter reads its own objects (for every filter, not only `id`), then intersects. Results
+are identical in all 480 pairs. The filtered shapes are **not** 1.15 times faster, so the stated pass criterion fails: the 7.9 percent filter reads 0.979, the token filter 0.996, and a
+text-length filter 0.991. Only a filter that matches nothing moved visibly (0.888). The unfiltered shape never read a live set. No file format or setting changed.
+
+Measured 2026-11-27 and 28 on one on-demand c7gn.4xlarge (us-west-2), baseline v0.1.77 (`b32b81d`) against the candidate, on a private server-side copy of the retained C5 checkpoint
+repaired by the baseline writer (55 row maps, about 17 minutes of writable serving). Protocol as C33: read-only servers, 8 Rayon workers, 64 probes, strong consistency,
+IDs only, 256 KiB blocks, 32-block coalescing, zero disk cache, a full engine-cache drop before every request, arms alternating AB/BA, one untimed warm-up, 80 pairs per case. Release builds
+target `neoverse-v1` with frame pointers.
+
+### Trace (`c36_trace.py`, 20 cold queries each, v0.1.77, p50)
+
+| Shape | ms | GETs | Live GETs | Live GETs start / last end, ms | Segments whose filter read waited for their own live GET |
+| --- | ---: | ---: | ---: | --- | ---: |
+| Unfiltered `top_k` 10 | 285 | 330 | **0** | n/a | n/a |
+| `title_initial = s` (7.9 percent) | 730 | 1,136 | **61** | 50.6 / 96.3 | **61 of 61** (the filter read starts about 1 ms after its live GET ends) |
+
+The unfiltered ANN path (slab directory) never loads a live set, so the brief's 61 GETs belong to the filtered shapes only. On filtered queries the live set is a serial wave in front of every
+segment's `filter.bfx` read, as Neon read it. The prediction that this would also be on the critical path of the whole query does not hold (below).
+
+### Acceptance (80 cold pairs per case; ratio is candidate over base p50, with the paired-resample 95 percent interval)
+
+| Case | Base p50 / p90, ms | Candidate p50 / p90, ms | Ratio (95%) | GETs base / cand | MB base / cand | Exact |
+| --- | ---: | ---: | ---: | ---: | ---: | :-: |
+| A/A control (baseline twice), 7.9% filter | 729.8 / 930.9 | 726.8 / 824.8 | 0.996 (0.970-1.026) | 1,153 / 1,152 | 1,112 / 1,112 | yes |
+| 7.9% filter (`title_initial = s`) | 725.9 / 813.0 | 710.4 / 805.2 | 0.979 (0.953-1.022) | 1,153 / 1,083 | 1,111.9 / 1,106.3 | yes |
+| Token filter (`text ContainsAllTokens "american"`, 4.7%) | 4,617 / 4,869 | 4,599 / 4,735 | 0.996 (0.983-1.003) | 1,344 / 1,276 | 3,119.7 / 3,114.0 | yes |
+| Unfiltered `top_k` 10 | 198.2 / 248.8 | 195.7 / 239.9 | 0.987 (0.925-1.090) | 282 / 288 | 95.0 / 95.7 | yes |
+| Control `id < 1000` | 305.3 / 328.9 | 292.8 / 318.0 | **0.959** (0.937-0.980) | 1,173 / 1,106 | 109.8 / 104.1 | yes |
+| Extra: filter that matches nothing | 195.9 / 261.4 | 174.0 / 364.0 | 0.888 (0.838-0.945) | 230 / 160 | 84.9 / 79.3 | yes |
+| Extra: `text_length >= 300` | 616.9 / 780.1 | 611.5 / 767.0 | 0.991 (0.946-1.027) | 721 / 651 | 385.1 / 379.5 | yes |
+
+Pass criteria: filtered shapes at least 1.15 times lower p50 and fewer GETs (GETs fell, p50 did not: **fails**); identical results (passes); no control slower (the `id < 1000` control is 4 percent
+faster, passes). The A/A control's interval includes parity. The unfiltered row's GETs (282 against 288) differ by run-to-run noise: neither build reads a live set there, and the interval includes parity.
+
+### Why the filtered shapes barely move
+
+Stage timeline of the 7.9 percent filter (median ms from request start; "first" and "last" are over the 61 segments):
+
+| Stage | Base | Candidate |
+| --- | ---: | ---: |
+| Snapshot warm starts | 48 | 49 |
+| First segment filter done / last segment filter done | 96 / 203 | 76 / 171 |
+| Slab directory known; memberships start | 99; 102 | 101; 101 |
+| Memberships done; snapshot warm done | 201; 208 | 192; 195 |
+| Scan done | 610 | 602 |
+| Response | 726 | 710 |
+
+The filters finish 20 to 30 ms earlier, but the query is gated by the slab memberships, which start when the directory is known (about 100 ms in both builds, with or without the live set) and
+take about 100 ms of their own reads, and then by the 350 ms scan of 1.1 GB. The live wave sat beside those chains, not on the one that ends the query. It only matters when nothing else follows
+the filter: a filter that matches nothing ends the query at the filters, and there p50 falls 22 ms and 70 GETs (230 to 160).
+
+### Sol's S3 warmth experiment (`c36_s3warm.py`, no engine change)
+
+Question: does a GET of one byte range warm a disjoint adjacent range of the same object inside S3? Reads only, 35 in flight (the production rerank fan-out), 16 KB reads on offsets nothing
+had touched, in-region from the instance, the 91 ANN objects of 306 MB or more, conditions rotated wave by wave. Last-byte time, p50 in ms (three sessions for the first rows, 385 to 735 reads per
+condition per session):
+
+| Read | Session 1 | Session 2 | Session 3 |
+| --- | ---: | ---: | ---: |
+| Far, nothing primed (a cold first read) | 91 | 88 | 81 |
+| Right after a 256 KB GET of the adjacent bytes | 44 | 42 | 43 |
+| Right after an 8 MB GET, adjacent | 44 | 43 | 45 |
+| 1 MB past a 256 KB GET | 44 | 44 | 46 |
+| 4 MB past it | | | 55 |
+| 16 MB past it | | | 88 |
+| Inside the primed bytes (control) | 43 | 42 | 44 |
+| Same object, over 32 MB from the primed bytes | | 91 | 81 |
+| Another object | | 90 | 84 |
+
+Yes, S3 warms adjacent bytes, but the median drop is **47, 46, and 38 ms** (adjacent against far), under the 49 ms bar: negative against the bar as set. The effect is real and local: it reaches
+about 1 MB past the primed range, is down to a 26 ms drop at 4 MB, and is gone at 16 MB and for the same object far away. It does not depend on the primed size (256 KB or 8 MB) and
+equals a reread. A layout round that puts the exact vectors within about 1 MB of the codes would save about 40 ms of the 100 to 150 ms rerank wave, not the 55 ms Sol projected, and only for reads that
+come after the scan's GET of that leaf has finished.
+
+### Tests
+
+`generation_zero_reads_no_live_set_and_later_generations_apply_theirs` (`tests/live_sets.rs`) counts the reads of `live.*` objects in a fresh process. At generation 0 six filter shapes (`Eq`,
+`NotEq`, `Not`, `id <`, `ContainsAllTokens`, `Or`) return the exact rows and read none. After a filtered delete and a delete by ID (generation above 0) the same shapes return exactly the live rows,
+and the set is read.
+
+### Cost
+
+One c7gn.4xlarge on demand from 23:59 to 01:09 UTC (1.2 hours) with a 160 GB root volume: about $1.5, under the $6 cap. The instance, key pair, security group, and the S3 prefix (693 objects, 77 GB)
+are deleted, with no multipart uploads left.
