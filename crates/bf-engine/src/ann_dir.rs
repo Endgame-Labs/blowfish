@@ -714,7 +714,20 @@ async fn filtered_live_masks(
         ))
     }))
     .await?;
-    let bytes = (key.len() * 2 + masks.len() * 16 + 256) as u64;
+    // The entry pins every mask, so it is charged for them even where the per-segment predicate
+    // cache has evicted its own copy.
+    let bytes = masks
+        .iter()
+        .flatten()
+        .map(|m| {
+            let s = m.statistics();
+            s.n_bytes_array_containers
+                + s.n_bytes_bitset_containers
+                + s.n_bytes_run_containers
+                + u64::from(s.n_containers) * 64
+        })
+        .sum::<u64>()
+        + (key.len() * 2 + masks.len() * 16 + 256) as u64;
     read_cache::insert(&key, bytes, Masks(masks.clone()));
     Ok(masks)
 }

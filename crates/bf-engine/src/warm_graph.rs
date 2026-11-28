@@ -1609,10 +1609,47 @@ async fn ranked_rows(
             }
         }
         (true, None) => return Ok(None),
-        (false, _) => entry
-            .graph
-            .candidates_with_norms(vector, ef, shortlist, mask, loan.scratch.as_mut().unwrap())
-            .map_err(segment::index_error)?,
+        (false, _) => {
+            // TEMPORARY (Round G28): a filtered query's walk that returns only allowed rows, in
+            // place of the widened post-filter beam.
+            let switch = g28_switch();
+            let filtered = match mask {
+                Some(allowed)
+                    if switch.contains("fwalk")
+                        && allowed.len() * 10 < entry.graph.len() as u64 * 9
+                        && allowed.len() * 100
+                            >= entry.graph.len() as u64 * g28_param(&switch, "fmin", 8) =>
+                {
+                    entry
+                        .graph
+                        .filtered_walk(
+                            vector,
+                            g28_param(&switch, "fef", 96) as usize,
+                            shortlist,
+                            allowed,
+                            g28_param(&switch, "stride", 128) as usize,
+                            g28_param(&switch, "seeds", 8) as usize,
+                            g28_param(&switch, "fcap", 6000) as usize,
+                            loan.scratch.as_mut().unwrap(),
+                        )
+                        .map_err(segment::index_error)?
+                }
+                _ => None,
+            };
+            match filtered {
+                Some(found) => found,
+                None => entry
+                    .graph
+                    .candidates_with_norms(
+                        vector,
+                        ef,
+                        shortlist,
+                        mask,
+                        loan.scratch.as_mut().unwrap(),
+                    )
+                    .map_err(segment::index_error)?,
+            }
+        }
     };
     drop(loan);
     #[cfg(all(test, target_os = "macos"))]
