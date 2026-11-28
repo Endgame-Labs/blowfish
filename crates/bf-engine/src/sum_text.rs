@@ -185,10 +185,16 @@ pub(crate) fn first_list(k: usize, loose: bool) -> Option<usize> {
 /// The list length that asks for every matching row: the last round before the full scorer.
 pub(crate) const ALL_MATCHES: usize = usize::MAX;
 
+/// The stream length after `MAX_LIST` for a plan with streams: a stream's rows need no column reads
+/// (their values come from the attribute's dictionary), so it can run deeper than the text lists,
+/// which a boost that is flat near its top needs to bound the rows it leaves out.
+pub(crate) const STREAM_LIST: usize = 16384;
+
 /// The next list length after `n`: four times as long up to `MAX_LIST`, then every matching row
 /// (which scores only the rows that match some clause, and needs no bound), then `None`.
-pub(crate) fn next_list(n: usize) -> Option<usize> {
+pub(crate) fn next_list(n: usize, streams: bool) -> Option<usize> {
     match n {
+        MAX_LIST if streams => Some(STREAM_LIST),
         ALL_MATCHES => None,
         n if n * 4 <= MAX_LIST => Some(n * 4),
         _ => Some(ALL_MATCHES),
@@ -895,11 +901,13 @@ impl SegmentSum {
     ) -> Result<Option<Candidates>, ApiError> {
         let clauses = &plan.clauses;
         let all_matches = n == ALL_MATCHES;
+        // Streams may run deeper than the text lists (see `STREAM_LIST`).
+        let stream_n = n;
         // One more than the rows there are, so no list is ever full and none needs a bound.
         let n = if n == ALL_MATCHES {
             class.rows.len() as usize + 1
         } else {
-            n
+            n.min(MAX_LIST)
         };
         let mut union = RoaringBitmap::new();
         let mut cutoffs = Vec::with_capacity(clauses.len());
@@ -949,7 +957,14 @@ impl SegmentSum {
             let drawn = if all_matches {
                 None
             } else {
-                match draw(state, doc, &values.values, values.truncated, &class.rows, n)? {
+                match draw(
+                    state,
+                    doc,
+                    &values.values,
+                    values.truncated,
+                    &class.rows,
+                    stream_n,
+                )? {
                     Draw::Done(d) => Some(d),
                     Draw::TooLong => None,
                     // The allowed rows hold none of the largest values (a selective filter):
@@ -1456,9 +1471,11 @@ mod tests {
         assert_eq!(first_list(100, false), Some(100));
         assert_eq!(first_list(1000, true), Some(1000));
         assert_eq!(first_list(4097, false), None);
-        assert_eq!(next_list(64), Some(256));
-        assert_eq!(next_list(1024), Some(4096));
-        assert_eq!(next_list(4096), Some(ALL_MATCHES));
-        assert_eq!(next_list(ALL_MATCHES), None);
+        assert_eq!(next_list(64, false), Some(256));
+        assert_eq!(next_list(1024, false), Some(4096));
+        assert_eq!(next_list(4096, true), Some(STREAM_LIST));
+        assert_eq!(next_list(STREAM_LIST, true), Some(ALL_MATCHES));
+        assert_eq!(next_list(4096, false), Some(ALL_MATCHES));
+        assert_eq!(next_list(ALL_MATCHES, false), None);
     }
 }

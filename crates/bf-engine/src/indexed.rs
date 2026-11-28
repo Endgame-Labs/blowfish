@@ -1472,7 +1472,7 @@ async fn sum_finish(
             )
             .await;
         }
-        n = sum_text::next_list(list);
+        n = sum_text::next_list(list, plan.docs.iter().any(|d| d.stream.is_some()));
         // Scoring every matching row proves a row-wise term's rows only when the bound for rows
         // that match no text stays under the `k`th total already found, which it cannot when a
         // boost dominates the text (then the all-rows scorer is cheaper).

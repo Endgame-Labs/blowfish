@@ -1859,7 +1859,7 @@ pub(crate) struct TopValues {
     pub truncated: bool,
 }
 /// Numbers kept per attribute and segment by [`filter_top`].
-const TOP_VALUES: usize = 2048;
+const TOP_VALUES: usize = 1 << 15;
 /// [`TopValues`] of an attribute, kept in a small process-wide map. `None` when the segment has no
 /// filter column for it.
 pub(crate) async fn filter_top(
