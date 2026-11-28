@@ -724,6 +724,45 @@ fn cluster_counts(
     )
 }
 
+/// Load (and cache) every slab's global row map without the directory, which only checks them
+/// (see [`memberships`]). A tier's reads can then start beside the directory's own. `None` for a
+/// slab that keeps no row map of its own.
+pub(crate) async fn slab_memberships(
+    store: &Storage,
+    slabs: &[bf_wal::Segment],
+    attr: &str,
+) -> Result<Vec<Option<Arc<Membership>>>, ApiError> {
+    futures::future::try_join_all(
+        slabs
+            .iter()
+            .map(|slab| crate::slab_rows::load(store, slab, attr)),
+    )
+    .await
+}
+
+/// [`memberships`] of a tier, from the maps [`slab_memberships`] already loaded: each is checked
+/// against the directory's row and cluster counts, and a slab without one takes the ordinary path.
+pub(crate) async fn checked_memberships(
+    store: &Storage,
+    slabs: &[bf_wal::Segment],
+    dir: &Directory,
+    attr: &str,
+    loaded: Vec<Option<Arc<Membership>>>,
+) -> Result<Vec<Option<Arc<Membership>>>, ApiError> {
+    if loaded.len() != dir.segments().len()
+        || loaded.iter().any(Option::is_none)
+        || loaded.iter().zip(dir.segments()).any(|(m, d)| {
+            m.as_ref().is_some_and(|m| {
+                m.row_ids().is_none_or(|r| r.len() != d.rows) || m.cluster_count() != d.clusters
+            })
+        })
+    {
+        // Let the ordinary path raise the corruption error or read what is missing.
+        return memberships(store, slabs, dir, attr).await;
+    }
+    Ok(loaded)
+}
+
 /// Load (and cache) the row-to-cluster map of every segment that has one. `None` for flat
 /// segments and for segments whose fragment predates the map.
 pub(crate) async fn memberships(
@@ -1336,8 +1375,10 @@ pub(crate) async fn search(
         dir.segment_totals().into_iter().unzip();
     // Filtered: allowed rows in each cluster, exactly, from the row-to-cluster maps.
     let counts: Vec<Option<Arc<ClusterCounts>>> = if filtered {
+        // Each segment's counts are independent: with dozens of slabs they run side by side.
+        use rayon::prelude::*;
         dir.segments()
-            .iter()
+            .par_iter()
             .enumerate()
             .map(
                 |(i, seg)| match (members.get(i).and_then(Option::as_ref), &lives[i]) {

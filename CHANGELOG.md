@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.79] - 2026-11-27
+
+### Changed
+
+- **Cold filtered vector queries are up to 1.2 times faster:** A cold filtered query on object storage read the slab directory before it started reading the slabs' row maps, translated its filtered rows into each tier's row numbers on one thread, and counted matching rows per cluster one slab at a time. The row maps are now read beside the directory, and the translation and the counts run in parallel. On 10M rows on S3, a `text_length` filter is 1.2 times faster and a filter matching 7.9 percent of rows 1.07 times faster at p50, with identical results and the same bytes read; unfiltered queries are unchanged. See Round C38 in `docs/benchmarks.md`.
+
 ## [0.1.78] - 2026-11-27
 
 ### Changed
@@ -567,7 +573,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.78...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.79...HEAD
+[0.1.79]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.79
 [0.1.78]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.78
 [0.1.77]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.77
 [0.1.76]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.76

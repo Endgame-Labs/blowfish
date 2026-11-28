@@ -18790,3 +18790,93 @@ On the earlier promoted server (`ef` lower, 17,155 for switch 0, bit 8 not yet b
 `warm_graph::tests::filtered_scan_hides_shadowed_rows_inside_the_allowed_set` fail with "test graph was never admitted" (memory admission under the full parallel run); it passes alone and on the rerun.
 
 Cleanup: the M4 run directory (fixture, store, binaries; about 26 GB) is deleted and nothing of mine is running there; the corpus fixture was fetched through this VM (about $2.4 of S3 transfer); no EC2; no bucket writes; `.scratch/g23` removed.
+
+## Round C38: the cold filtered waterfall is shorter by 45 to 100 ms (7.9 percent filter 1.07 times, text length 1.20 times), below the 1.25 bar, with identical results
+
+The brief's pass bar (filtered shapes at least 1.25 times lower p50) is **not met**: the 7.9 percent filter is 0.932 (1.07 times), the token filter 0.977, `text_length >= 300` 0.830 (1.20 times), and
+`id < 1000` 0.997. All 560 pairs return identical ordered IDs and f64 distance bits, bytes read are equal, and the unfiltered control (1.018, interval 0.960 to 1.081) and an A/A control (1.020, 0.983 to 1.041) sit
+at parity. No file format or setting changed.
+
+Measured 2026-11-28 on one on-demand c7gn.4xlarge (us-west-2, 0.85 hours, about $1.2), baseline `a3f1606` (v0.1.77 plus 21 commits, the "v0.1.78" of the brief) against the candidate, on a private
+server-side copy of the retained C5 checkpoint repaired by the baseline writer (55 row maps, 12 minutes of writable serving, manifest 903). Protocol as C36: read-only servers, 8 Rayon workers,
+64 probes, strong consistency, IDs only, 256 KiB blocks, 32-block coalescing, zero disk cache, a full engine-cache drop before every request, arms alternating AB/BA, one untimed warm-up, 80 pairs per case.
+Release builds target `neoverse-v1` with frame pointers.
+
+### Trace (`c38_trace.py`, 20 cold queries per shape, baseline, p50 ms from the request start)
+
+| Stage | 7.9% filter | `id < 1000` | No match |
+| --- | ---: | ---: | ---: |
+| Snapshot warm starts | 50 | 49 | 54 |
+| First filter result (the "non-empty" signal that starts the memberships) | 74 | 125 | never |
+| Slab directory loaded (it also waits for the lineage maps) | 95 | 100 | 108 |
+| Memberships start / last read ends (55 reads, 60 MB) | 98 / 186 | 125 / 204 | not read |
+| Last filter result | 165 | 173 | 175 |
+| Filtered tier mask translated (CPU on the reactor) | 189 to 220 | 206 | 183 |
+| Centroids ranked / plan made | 225 / 240 | 208 / 209 | n/a |
+| First leaf GET | 240 | 209 (exact rows) | n/a |
+| Scan done | 596 | 311 | n/a |
+| Response | 751 | 312 | 184 |
+
+The critical chain is the memberships and the filter wave, which end together, then 31 ms of mask translation and 15 ms of planning, then a bandwidth-bound scan (956 MB in 340 ms for the 7.9
+percent filter). Two of the brief's premises do not hold:
+
+- **The directory and the centroid rank are not on the chain.** The directory is known at about 95 ms and is already loaded beside the filters and the lineage maps by the snapshot's warm task;
+  ranking waits for the filters only because it needs their masks, and they end later.
+- **A slab cannot start its scan as its membership arrives, and a slab with no survivors cannot be skipped, without changing results.** The probe plan is global: `pick_clusters` takes the whole tier's
+  matching total (probe count, the coverage goal, and the stop rule), and the exact cluster counts of every slab. A slab has no row-range metadata (its rows are an arbitrary subset of global rows,
+  clustered), so only reading its row map says whether it holds a survivor. Starting leaf reads on a guess of the plan would read bytes the plan would not (the `id < 1000` plan reads 104 MB, and a
+  speculative prefix would add about 95 MB to it).
+
+### The change
+
+One path, no setting (SPEC 25):
+
+1. **Memberships start without the directory** (`snapshot.rs`, `ann_dir::slab_memberships` and `checked_memberships`). The 55 row-map reads need only the slabs; the directory only checks their row and
+   cluster counts. They now start at the first positive filter result (still not for a filter that matches nothing) beside the directory and lineage reads, and are checked against the directory
+   when both are in. Start 98 to 76 ms for the 7.9 percent filter.
+2. **The filtered tier mask is translated in parallel** (`ann.rs::filtered_tier_mask`, one rayon task per covered segment): 31 ms to 5 ms at 7.9 percent, and 74 ms to 12 ms for `text_length` (4.8 M rows).
+3. **Per-slab cluster counts run in parallel** (`ann_dir::search`): plan 14 ms to 3 ms at 7.9 percent, and 50 ms to 7 ms for `text_length`.
+
+Stage timeline, p50 ms, 80 pairs (base / candidate):
+
+| Stage | 7.9% filter | `text_length >= 300` |
+| --- | ---: | ---: |
+| Memberships start | 105.5 / 76.3 | 100.0 / 76.0 |
+| Memberships done (snapshot warm done) | 189.5 / 170.8 | 258.8 / 177.5 |
+| Tier mask translated | 224.7 / 189.2 | 333.1 / 274.4 |
+| Plan made | 244.3 / 197.1 | 389.6 / 286.8 |
+| Scan done | 605.3 / 551.6 | 495.9 / 391.7 |
+| Response | 710.4 / 662.2 | 602.6 / 500.2 |
+
+### Acceptance (80 cold pairs per case; ratio is candidate over base p50, with the paired-resample 95 percent interval)
+
+| Case | Base p50 / p90, ms | Candidate p50 / p90, ms | Ratio (95%) | GETs base / cand | MB base / cand | Exact |
+| --- | ---: | ---: | ---: | ---: | ---: | :-: |
+| A/A control (baseline twice), 7.9% filter | 694.5 / 790.2 | 708.7 / 795.8 | 1.020 (0.983-1.041) | 1,083 / 1,082 | 1,106.3 / 1,106.3 | yes |
+| 7.9% filter (`title_initial = s`) | 710.4 / 806.4 | 662.2 / 778.4 | **0.932** (0.909-0.962) | 1,082 / 1,085 | 1,106.3 / 1,106.3 | yes |
+| Token filter (`text ContainsAllTokens "american"`) | 4,601.7 / 4,774.5 | 4,496.9 / 4,625.3 | 0.977 (0.967-0.987) | 1,275 / 1,275 | 3,114.0 / 3,114.0 | yes |
+| `text_length >= 300` | 602.6 / 769.0 | 500.2 / 635.3 | **0.830** (0.787-0.864) | 650 / 654 | 379.6 / 379.6 | yes |
+| `id < 1000` | 288.9 / 313.8 | 287.9 / 311.1 | 0.997 (0.984-1.020) | 1,104 / 1,106 | 104.1 / 104.1 | yes |
+| Control: unfiltered `top_k` 10 | 188.4 / 228.2 | 191.8 / 222.6 | 1.018 (0.960-1.081) | 291 / 286 | 96.2 / 95.5 | yes |
+| Extra: filter that matches nothing | 155.3 / 167.4 | 154.8 / 177.6 | 0.997 (0.972-1.021) | 160 / 160 | 79.3 / 79.3 | yes |
+
+Pass criteria: filtered shapes at least 1.25 times lower p50 (**fails**: 1.07, 1.02, 1.20, and 1.00 times); identical results (passes); GETs and bytes not higher (bytes equal; GETs differ by 0 to 4 of
+about 1,000, inside the A/A control's run-to-run spread, since hedged duplicate reads count as attempts); no control slower (the unfiltered control is 1.8 percent higher, with an interval that includes parity).
+
+### Why the rest of the chain stays
+
+After the changes, the 7.9 percent query still spends about 200 ms before the first leaf GET (manifest 50, the filter wave ending at 170 to 175, the memberships ending at 170 to 180, and a few milliseconds of
+planning) and then 350 ms on the scan (the network, at 22 Gbit/s) and 95 ms on the rerank wave. The only exact lever left on the first 200 ms is starting the memberships before the first filter
+result, which would read 60 MB and 55 objects for a filter that matches nothing (and only about 10 ms for the broad shapes, 25 ms for `id < 1000`). Moving the scan earlier needs the plan, and the plan needs
+the exact counts of every slab. A format change that puts a per-slab row range or a cluster-count summary in the tier directory could let the plan, and the skip of empty slabs, start without the row maps.
+
+### Tests
+
+The existing tier tests cover the changed paths (31 `vector_locator` tests, including `filtered_tiers_answer_after_lineage_deletes_and_beside_uncovered_segments`, which exercises the translation across
+lineage moves, and `d4c_filtered_complete_tier_rebuilds_a_missing_or_stale_directory`, which exercises the checked-memberships fallback). Scripts: `crates/bf-engine/examples/c38_trace.py` (the critical
+chain from a `cold_ab.py` run) and `c38_pairs.sh` (the paired runs).
+
+### Cost
+
+One c7gn.4xlarge on demand from 01:58 to 02:49 UTC (0.85 hours): about $1.2, under the $6 cap. The instance, key pair, security group, and the S3 prefix (693 objects, 77 GB) are deleted, with no
+multipart uploads left.
