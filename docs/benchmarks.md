@@ -20028,3 +20028,44 @@ a 60 to 85 ms read (this round). What is left is smaller reads inside the bundle
 
 Two on-demand c7gn.4xlarge hosts for 0.6 and 0.15 hours (about $1 in all with the root volumes), about 400 GB of in-region GET traffic from the fixture and the copies (no transfer charge; about 250,000 GETs) and 209 MB of server-side copies under `tmp/c45/` (twice, deleted). Both instances are terminated and their key pairs,
 security groups, and the prefix are deleted; the retained fixture was only read. Scripts: `c45_sections.py`, `c45-fetch/`, `c45_fetch_runs.py`, `c45_paired.py`, `c45_fetch_summary.py`, `c45_cpu.py`, `c45_model.py` (with the existing `c41_drive.py`).
+
+## Round C46: a priming GET warms a leaf's span to 34 ms at p50 but not under 50 ms at p90, and the wave bound is 1.0 to 1.2 times (stopped at the physics gate, no engine change)
+
+Question: can small priming GETs, issued while the scan runs near the likely rerank pages, make the cold rerank wave's reads land on warm bytes (Neon, 13:25 idea 2)?
+Answer: the warmth is real and holds across a leaf's span, but the brief's gate (a prime of 16 KiB or less bringing the follow-up p90 under 50 ms) fails in all 36 cells, and the wave
+bound from these reads alone is about 1.0 to 1.2 times at p50, at or under the 1.2 bar before any coverage loss or added GETs. **Stopped after step 1; no model, no build, no engine change.**
+The script is `c46_physics.py` (reads only).
+
+Measured 2026-11-28 on one on-demand c7gn.4xlarge (Ubuntu 24.04 arm64, us-west-2, about 0.4 h), boto3 1.40, instance-profile credentials, in the 138 objects of 64 MiB or more of the retained C5 10M
+fixture (aged, written 4 days earlier; read only). Each condition is 6 waves of 35 concurrent 16 KiB reads (210 reads), at offsets at least 3 MiB from every other point of the run, rotated wave by wave. A prime is a ranged GET of
+1 byte, 4 KiB, or 16 KiB at offset p, finished and then followed after the delay by a 16 KiB read at p plus the offset in the table.
+
+Control (a 16 KiB read at an offset nothing touched, 175 reads, first wave dropped): **77 ms p50, 101.5 ms p90** (C34: 72 and 110). The first wave of the control (877 ms p50) paid TLS setup on 35 fresh connections, so I dropped it;
+the primed conditions ran after warm-up and are unaffected. An earlier aborted pass (a slow offset picker) touched about 5,000 reads' offsets at random, so up to a tenth of the later offsets may have started warm: it can only lower the control.
+
+Follow-up 16 KiB read, p50 / p90 in ms:
+
+| Prime | Follow-up at | 50 ms delay p50 / p90 | 150 ms p50 / p90 | 300 ms p50 / p90 |
+| --- | --- | --- | --- | --- |
+| 1 byte | -512 KiB | 35 / 59 | 32 / 53 | 34 / 61 |
+| 1 byte | +512 KiB | 32 / 54 | 34 / 68 | 35 / 54 |
+| 1 byte | +1 MiB | 34 / 65 | 33 / 63 | 33 / 66 |
+| 1 byte | +2 MiB | 33 / 66 | 34 / 67 | 36 / 64 |
+| 4 KiB | -512 KiB | 34 / 62 | 35 / 69 | 33 / 59 |
+| 4 KiB | +512 KiB | 33 / 63 | 33 / 60 | 33 / 60 |
+| 4 KiB | +1 MiB | 33 / 59 | 34 / 61 | 34 / 64 |
+| 4 KiB | +2 MiB | 35 / 74 | 33 / 63 | 34 / 69 |
+| 16 KiB | -512 KiB | 34 / 70 | 34 / 60 | 35 / 68 |
+| 16 KiB | +512 KiB | 34 / 60 | 34 / 64 | 32 / 52 |
+| 16 KiB | +1 MiB | 32 / 61 | 33 / 57 | 33 / 59 |
+| 16 KiB | +2 MiB | 34 / 72 | 33 / 64 | 34 / 61 |
+
+- **Every cell is 32 to 36 ms at p50 and 52 to 74 ms at p90.** The prime's size (1 byte to 16 KiB), the side (before or after), the distance (512 KiB to 2 MiB), and the delay (50 to 300 ms) make no visible difference: the best p90 is 52 to 53 ms (16 KiB prime then +512 KiB at 300 ms, and 1 byte then -512 KiB at 150 ms), the worst 74. **No cell is under 50 ms**, so the stop rule fires. Pooled over all 7,560 primed reads: p50 34, p90 62, p95 78, p99 112 (control p95 117, p99 138).
+- **The tail, not the median, sets the wave.** A wave of 47 reads ends at about its p98. Drawing 47 reads at random from the pooled samples gives a wave maximum at p50 of 88 to 103 ms primed (1 byte at plus or minus 512 KiB: 88; all primes: 102) against 132 ms for the control, a saving of 30 to 44 ms; for 94 reads (the 7.9 percent filter) the saving is 3 to 35 ms. Against a traced query p50 of 233 ms (C44) that is at most 1.15 to 1.23 times for unfiltered queries, **and it assumes every rerank page has a prime within 2 MiB that finished before the scan ended**, which a prime issued after scoring cannot do for the last leaves scored, and which costs one extra GET per primed leaf (48 to 128 primes on 283 GETs is 17 to 45 percent).
+- **Why the model was not run.** The 10M trace needs a 77 GB server-side copy and about 13 minutes of writable repair for the row maps (C27, C34, C44) plus a release build on the instance, for a bound that already sits at the bar and before coverage and GET costs. The measured physics gives an upper bound, so the decision does not need the trace.
+
+What would change this: a prime that is itself free (a read the scan already makes landing within 2 MiB of the rerank pages, which is C14's cluster-local placement of exact vectors beside the codes: a format change, C44 left it unmodeled), or a measured hedge-free wave tail that is much longer than C34's 110 to 150 ms, which would raise the saving.
+
+### Cost
+
+One on-demand c7gn.4xlarge for about 0.4 hours (about $0.4). The instance is terminated, and the key pair and security group are deleted; no S3 prefix was written, and the fixtures were only read.
