@@ -69,8 +69,8 @@ fn plain_shape(request: &QueryRequest) -> Option<(&str, &[f32], usize)> {
 
 /// The best `k` of the graph's rows and the state's tail documents, as the general path's
 /// `merge_tail` and result evaluator order them (distance, then ID). `None` when the answer is
-/// not plain: a tail error (the general path reports it), a winner whose ID is neither an integer nor a canonical UUID, or an ID
-/// twice.
+/// not plain: a tail error (the general path reports it), a winner whose ID is a string that is not a canonical UUID in an answer of UUIDs,
+/// or an ID twice.
 fn merge_tail(
     state: &NamespaceState,
     attribute: &str,
@@ -80,6 +80,8 @@ fn merge_tail(
     tail: &crate::tail::VectorCache,
 ) -> Option<Vec<(IdRef, f64)>> {
     let mut heap = std::collections::BinaryHeap::new();
+    // A table of strings that are not all UUIDs keeps every string as text, tail included.
+    let text = hits.iter().any(|(id, _)| matches!(id, IdRef::Str(_)));
     for (id, distance) in hits {
         crate::indexed::offer(&mut heap, &id.to_id(), distance, false, k);
     }
@@ -99,9 +101,15 @@ fn merge_tail(
     winners.sort_unstable();
     let merged = winners
         .into_iter()
-        .map(|hit| IdRef::from_id(&hit.id).map(|id| (id, hit.score)))
+        .map(|hit| {
+            if text {
+                Some((IdRef::from_id_text(&hit.id), hit.score))
+            } else {
+                IdRef::from_id(&hit.id).map(|id| (id, hit.score))
+            }
+        })
         .collect::<Option<Vec<_>>>()?;
-    let mut ids: Vec<IdRef> = merged.iter().map(|(id, _)| *id).collect();
+    let mut ids: Vec<&IdRef> = merged.iter().map(|(id, _)| id).collect();
     ids.sort_unstable();
     (!ids.windows(2).any(|w| w[0] == w[1])).then_some(merged)
 }

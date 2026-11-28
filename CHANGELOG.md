@@ -9,6 +9,7 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 ### Changed
 
 - **Recluster is 1.27 times faster:** After refining its leaf centers, recluster assigned every row to a leaf a second time from scratch. Rows that move land only in nearby leaves, so the second pass now scores each leaf's rows against its 80 nearest leaves. On BEIR NQ (2.7M rows, 1,024-dimensional) on an 8-core instance, installing a tier takes 128 s instead of 163 s, recall@10 is within 0.0003, and query latency is unchanged. About 12 percent of rows land in a different leaf than before, which changes no format. See Round RR9 in `docs/benchmarks.md`.
+- **Warm vector queries with ID-range filters or string IDs are 2.5 to 6.6 times faster:** A filter on ID ranges built a key and took a cache lock per segment; it now serializes the filter once and makes one cached lookup per query, so a scattered 1 percent ID-range filter on BEIR NQ rises from 845 to 5,363 queries per second on the M4 (a 50 percent one 5.1 times). Ordinary string IDs (not integers or UUIDs) sent warm queries through a slower projection path; the warm graph now keeps them in a packed table and resolves only the winners: on a million rows, 2.5 times faster at `top_k` 10 and 6.6 times at `top_k` 100. Identical results. See Round G28 in `docs/benchmarks.md`.
 
 ## [0.1.84] - 2026-11-28
 

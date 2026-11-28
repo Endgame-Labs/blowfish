@@ -311,11 +311,18 @@ async fn boundary(
         if before(id_at(values, values.len() - 1)?) {
             continue;
         }
-        let mut within = Vec::with_capacity(values.len());
-        for n in 0..values.len() {
-            within.push(before(id_at(values, n)?));
+        // IDs ascend, so the boundary is a binary search (about twelve comparisons, where
+        // classifying every row of the block took one per row).
+        let (mut low, mut high) = (0, values.len());
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if before(id_at(values, mid)?) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
         }
-        return Ok((i * BLOCK_ROWS + within.partition_point(|b| *b)) as u32);
+        return Ok((i * BLOCK_ROWS + low) as u32);
     }
     Ok((end * BLOCK_ROWS).min(segment.row_count as usize) as u32)
 }

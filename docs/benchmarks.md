@@ -19830,3 +19830,74 @@ No layout change pays: aged small objects model at or slower than today's traced
 ### Cost
 
 One on-demand c7gn.4xlarge for about 1.2 hours (about $1.2), about 200,000 PUTs for three test sets (about $1), and the 77 GB server-side copy for under an hour (cents). The instance, key pair, security group, and the `tmp/c44/` prefix are deleted; the retained fixtures were only read.
+
+## Round G28: a filter's per-segment masks are one cached lookup (6 times the rate on a scattered 1 percent filter), and strings and the middle selectivities are measured
+
+**Setup:** Round G27's, except where item 3 says otherwise (the Apple M4, shared Mac mini, 10 cores, 16 GB; full BEIR NQ, 2,681,468 rows, 1,024-d f16 cosine; the frozen v0.1.19 fixture; release binaries, indexing off; the graph promoted the ordinary way with `g15_promote.py`; the native driver, 16 connections, 15 seconds per arm after a serial quality pass over 1,000 queries; `top_k` 10, IDs only; recall@10 against the exact filtered top 10 over the stored f16 values). The filters are G27's (`id-P` is `id < P percent`; `sc-P` is an Or of id ranges at random places: `sc-50` is 10 ranges of 5 percent, `sc-20` 4, `sc-5` 5 of 1 percent, `sc-1` 5 of 0.2 percent), plus two new ones for item 2 (`id-10`, and `sc-10`: 5 ranges of 2 percent; `g28_truth.py`). Each item ran on one promoted server, as arms of one temporary switch file the server re-read every 300 ms (`g28_arms.py`; the switch is not in the tree), the arms alternated (O N N O), and every pair's responses were compared by SHA-256. The baseline arm of each pair is v0.1.84's behavior. Four servers were promoted (three on the integer store at `ef` 64, 100, and 80, and one on the string store at `ef` 100; graph ready at 12 to 17 minutes, usable at 16 to 30), because a build with a change needs a new promotion.
+
+### 1. The Or-of-ID-ranges mask: the cost was never the arms, it was the lookup
+
+**Profile first** (v0.1.84, `sample` of the promoted server under the driver at 16 connections, 4 seconds, `sc-1` against `id-1`, which scan the same 26,815 rows): `sc-1` ran 891 q/s and `id-1` 3,715 q/s. Of the samples under `segment::filter_live`, 2,415 (sc-1, for 3,560 queries) against 668 (id-1, for 14,800 queries): about 0.68 against 0.05 ms of sampled stack time per query. The largest single stack in the server that is not idle was jemalloc's `malloc_mutex_lock_slow`, 927 samples in `sc-1` and none in the top of `id-1`, and 1,184 of its samples sit under `filter_live`. `filter_rows` was not on any stack: the predicate cache answers every segment's mask after the first query. What costs is everything around the cache hit, per segment (29 on this fixture) per query: `filter_live` serialized the whole filter and the schema to JSON, and each segment's files, to build the cache key, and each lookup took the decoded cache's one lock. With an Or of 5 `And`s (20 comparisons) that is 29 allocation-heavy serializations and 29 lock trips per query, which at 16 clients contends the allocator and the lock. A single `Lt` is small enough to hide it.
+
+**Fix** (`ann_dir::live_masks`, the one path every filtered ANN query takes): the filter and the schema are serialized once per query, the segments' IDs, live generations, live objects, and row counts are appended, and the whole vector of per-segment masks is one decoded-cache entry (charged for the bitmaps it pins, so an evicted predicate is not pinned for free). A miss resolves the segments as before and inserts the vector. The merge of ID intervals that the idea proposed would only change a miss, so it was not built; I did make the one cold-path piece that scaled with the block: after a seek finds the block holding the boundary, the position inside it is a binary search (about 12 comparisons) where it classified all 4,096 rows. That change is covered by the existing seek tests and was not measured separately (the measured filters repeat, so they hit the cache).
+
+| Case | v0.1.84 q/s (CPU per query) | This round q/s (CPU per query) | Ratio | Recall@10 | Responses |
+|---|---|---|---:|---:|---|
+| sc-1 | 845 (11.2 ms) | **5,363** (1.70 ms) | **6.3x** | 1.0000 | identical |
+| sc-50 | 537 (17.5 ms) | **2,718** (3.34 ms) | **5.1x** | 0.9931 | identical |
+| id-1 | 5,631 (1.62 ms) | 6,513 (1.38 ms) | 1.16x | 1.0000 | identical |
+| id-50 | 2,804 (3.26 ms) | 2,878 (3.19 ms) | 1.03x | 0.9936 | identical |
+| id-20 | 1,110 (8.2 ms) | 1,120 (8.1 ms) | 1.01x | 0.9946 | identical |
+| sc-20 | 1,079 (8.4 ms) | 1,105 (8.2 ms) | **1.02x** | 0.9962 | identical |
+
+(Server with `ef` 100, except `id-1`, which ran on the `ef` 64 server. That server gave the same shape: sc-1 850 to 5,504 (6.5x), sc-50 518 to 3,090 (6.0x), sc-20 1,162 to 1,234 (1.06x), id-1 5,631 to 6,513.) The old arm's cost is the same in every case that has a long filter (11 to 18 ms), and the new arm's is the case's own work: `sc-1` now costs what `id-1` does (1.70 and 1.38 ms), so a scattered filter and a prefix filter at the same share are the same price.
+
+**Pass: at least 1.4x on `sc-1` and `sc-20`, identical results.** `sc-1`: **met** (6.3x). `sc-20`: **not met** (1.02x to 1.06x). `sc-20` runs G27's widened walk (a beam of 4,000), and its 8.2 ms is that walk: `id-20`, a one-comparison filter, costs the same 8.1 ms, and G27's own `sc-20` (1,178) already sat at its `id-20` (1,226). The mask never was its cost. I tried to make that walk cheaper without changing its answer, and neither attempt ships:
+
+| Try (`sc-20`, same server, alternated) | q/s | CPU per query | Responses |
+|---|---:|---:|---|
+| the walk as it is | 1,028 | 8.85 ms | |
+| a max-heap beam and a min-heap frontier, no one-bit screen (the standard algorithm) | 795 vs 1,097 | 11.4 vs 8.2 ms | different (recall 0.9963 against 0.9962) |
+| the same beam kept in sorted chunks of 256 (the sample showed a third of the walk in `memmove`), screen and all | 1,124 vs 1,028 | 8.1 vs 8.85 ms | **identical to the bit** (tested against the sorted array for 5 queries and 8 widths, with and without the screen) |
+
+The heap loses because the screen is what makes the walk cheap (it skips the SQ8 score of most neighbors once the beam is full), and a heap has no cheap tail to read it from. The chunked beam is exact but gives 1.09x at 20 percent and nothing at 50 percent (a beam of 1,600 moves little), well short of the bar, so it is removed: a second search routine for 9 percent is not worth keeping. Where `sc-20`'s 8 ms goes is the screened walk itself (scoring about 4,000 nodes), the beam G27 sized for recall at or above IVF's.
+
+### 2. Middle selectivity (5 to 12 percent): the seeded walk is faster and not as good; killed
+
+Built and measured on the first server (`ef` 64): from a sample of every 128th allowed row ranked by one-bit code, the nearest 8 seed a walk over the whole graph in which every node is a stepping stone but only allowed nodes enter the `ef` results; it stops when its frontier passes the farthest of them or after an evaluation cap, and falls back to the scan when the cap ends it with fewer than 30 rows. Today's scan screens every allowed row's one-bit code, rescoring the best 5,100 (recall 1.0000 on `id-5`, since it sees every allowed row).
+
+| Case | Scan (today) q/s, recall | Seeded walk, cap 3,000 | cap 6,000 | cap 12,000 | cap 24,000 | cap 48,000 |
+|---|---|---|---|---|---|---|
+| id-5 | 2,816, 1.0000 (3.2 ms) | **7,370** (2.6x), **0.9483** | 5,029, 0.9701 | 2,914, 0.9810 | 1,548, 0.9883 | 780, 0.9928 |
+| sc-5 | 2,737, 0.9999 | 6,340 (2.3x), 0.8588 | 4,772, 0.9313 | 2,831, 0.9685 | 1,528, 0.9852 | 771, 0.9935 |
+| id-10 | 1,605, 1.0000 (5.7 ms) | 6,100 (3.8x), 0.9577 | | | | |
+| sc-10 | 1,573, 0.9999 | 5,500 (3.5x), 0.8728 | | | | |
+
+The result width `ef` (64, 96, and 160 in the cap 3,000 column) changed nothing: the cap ends every walk, so the answer is the same bits. The curve is the answer: **the walk is 2.3x to 3.8x faster at recall 0.86 to 0.96, and by the time it reaches 0.98 it costs what the scan does** (cap 12,000: 2,914 q/s against 2,816 at recall 0.9810), and it does not reach 1.0000 at any cap I tried. The pass was at least 1.3x at recall at least today's, which is the scan's exact 1.0000 (0.9999), so **it is killed** and the scan stays. The scattered filters do worst: with five regions the nearest seeds land in one and the others are reached late. Neon's in-walk predicate (no bitmap built first) was not tried separately: after item 1 the allowed bitmap is a cached lookup, so there is no per-query bitmap to avoid, and a walk that tests rows against the cached bitmap is what ran above. Where the scan's 3.2 ms goes (a `sample` at 16 connections on `id-5`): the one-bit Hamming screen over 134,000 codes is about half of the busy samples, the SQ8 rescore of the survivors about a fifth, and building the allowed row list about a tenth, so the next gain there is the screen's bandwidth (17 MB of codes per query), not the walk.
+
+### 3. String IDs: a packed table puts them on the resident path, 2.5 to 6.6 times at `top_k` 100 and 10
+
+**What was slow.** The resident row-to-ID table held integers and canonical UUIDs only; any other string ID left the tier with no table, so every ID-only query hydrated each winner's ID from the documents (a document projection that decodes the ID column's blocks, then a `Document` per winner). **Now** (`IdTable::Str`, `bf_types::IdRef::Str`): the IDs of a tier whose IDs are strings that are not all canonical UUIDs are packed in one byte array with a `u32` offset per row (4 bytes plus the ID's length, 19 bytes a row for `nq:doc:00000123`), and only the `top_k` winners' text is copied out (`IdRef::Str(Box<str>)`, which is why `IdRef` stopped being `Copy`). A table is built only up to 48 bytes a row (longer IDs keep the document path), and the bytes beyond the 16 a row the graph's reservation already holds are charged to the reservation when the table is published. A UUID tier still gets its 16-byte table (a tier whose first rows are UUIDs and a later row is not turns into a string table). The tail merge keeps every string as text in a string tier, so a tail ID that looks like a UUID orders and compares with its neighbors by bytes, as the general path does. The JSON writer escapes the text the way the general path's serializer does.
+
+**Measured** on the M4 (one promoted server, `ef` 100, the native driver, 16 connections, 15 seconds per arm, order O N N O O N). The store is the **first 1,000,000 NQ rows** with the ID `nq:doc:` and the row number to 8 digits, loaded with `g28_load_ids.py`, a copy of `bench/nq/load.py` with an ID-kind option (vectors and IDs only; its recall is of this subset against the full corpus's truth, so it is low and only the pairs' equality matters), reclustered, and promoted the ordinary way. The full 2,681,468 rows did not fit the time box (a load, a recluster, and a 30-minute promotion for each of the string and UUID stores). "Old" is v0.1.84's path: the resident table exists but the arm ignores it, so every ID is hydrated from the documents.
+
+| `top_k` | Old q/s (CPU per query, p50) | New q/s (CPU per query, p50) | Ratio | Responses |
+|---|---|---|---:|---|
+| 10 | 8,246 (1.12 ms, 1.76 ms) | **20,770** (0.44 ms, 0.69 ms) | **2.5x** | identical (SHA-256 of every response's IDs and distances over 1,000 queries) |
+| 100 | 1,638 (5.86 ms, 9.9 ms) | **10,790** (0.84 ms, 1.27 ms) | **6.6x** | identical |
+
+Pass: at least 1.3x with identical ordered IDs and distances: **met** at both. The brief's trigger was "strings at least 1.5x slower than UUIDs": the UUID control was not run on the M4 (it needs a second store and a 30-minute promotion that did not fit), so I applied the fix on the strength of the old path's measured cost instead. The new rates are the G21 UUID rates' size (16,189 and 8,530 q/s on the full 2.68M rows at G21's 16-connection run on this machine, at `top_k` 10 and 100). A run on this VM (shared and busy, load average 7 to 12, so only the pairs mean anything) agrees in direction at a much smaller size: strings old 9,200 q/s and new 11,500 q/s at `top_k` 10 (1.25x), 3,420 and 4,330 at `top_k` 100 (1.26x), and one UUID arm of the same 1M rows at 12,189 q/s, so on that machine the new string path is within 6 percent of the UUID path at `top_k` 10 and the old one 24 percent below it. (The VM's UUID server stopped answering from the graph after that one arm (1,298 of 17,500 requests in the next arm, none after), cause not found, so its `top_k` 100 control was lost.)
+
+**Tests.** `typed_ids_path_serves_string_ids_byte_identically` writes whole response bodies of the typed path and the general path for 18 `top_k` values on six queries, with IDs that need JSON escapes (a quote, a backslash, and non-ASCII text), whose first rows are UUIDs, with no tail, with inserts that tie with base rows (a string and a canonical UUID text among the strings), and with overwrites and deletes among the top `k`, and requires equal bytes. `filter_masks_are_one_cached_entry_that_follows_the_segments` (item 1) checks that a repeat of a filter returns the same masks, another filter different ones, and a delete that retires the live objects is seen.
+
+### Not shipped
+
+- The seeded filtered walk (item 2): killed on recall (above). The measurement switch and the walk are not in the tree.
+- A heap beam without the screen, and a beam in sorted chunks (item 1): the first is slower, the second 1.09x at 20 percent (see item 1).
+- The Or-interval merge: the profile showed the arms are not the cost, and a miss is not what the measured queries pay.
+
+### Notes
+
+- The measurement switch (`BF_G28_SWITCH`, a file the server re-read every 300 ms) paired the arms on one server; it is not in the tree. `g28_arms.py` is the driver that wrote the lines and needs a build that has such a switch.
+- `native_drive` now reads a string ID that ends in `:` and the row number back to its corpus row for the recall check.
+- Cost: about 19 GB of S3 transfer to this VM (the fixture and the corpus) and 20 GB of rsync to the M4 (about $2). The run directories on both machines are deleted and nothing of mine is running.

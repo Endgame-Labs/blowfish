@@ -1,0 +1,168 @@
+# /// script
+# dependencies = ["numpy==2.5.4", "pyarrow"]
+# ///
+"""Round G28 (a copy of bench/nq/load.py with `--id-kind int|uuid|string`): load BEIR NQ into a running blowfish.
+
+String IDs are `nq:doc:` and the row number to 8 digits (`native_drive` reads the row back from the digits).
+
+Original doc: id, f16 vector (cosine), title, and text (BM25).
+
+Usage: uv run python load.py DATA_DIR --base-url http://127.0.0.1:18100 --namespace nq [--rows N] [--vectors-only]
+
+`--vectors-only` writes id and vector only and needs just `corpus.f16` (the same-machine Mac runs, where
+Qdrant and LanceDB get vectors only too).
+
+Document id i is corpus row i (`corpus_ids.txt` line i). Vectors go over the wire as base64 little-endian f32,
+as the official SDKs send them, and are stored as f16 (the schema declares `[1024]f16`). Writes retry on 429 and
+transport errors, so the server's write backpressure paces the load.
+"""
+
+import argparse
+import base64
+import http.client
+import json
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from urllib.parse import urlparse
+
+import numpy as np
+import pyarrow.parquet as pq
+
+DIM = 1024
+SCHEMA = {
+    "vector": {"type": f"[{DIM}]f16", "ann": {"distance_metric": "cosine_distance"}},
+    "title": {"type": "string"},
+    "text": {"type": "string", "full_text_search": True},
+}
+
+local = threading.local()
+
+
+def post(base: str, path: str, body: bytes):
+    u = urlparse(base)
+    delay = 0.25
+    while True:
+        conn = getattr(local, "conn", None)
+        if conn is None:
+            conn = local.conn = http.client.HTTPConnection(u.hostname, u.port, timeout=600)
+        try:
+            conn.request("POST", path, body, {"Content-Type": "application/json"})
+            r = conn.getresponse()
+            data = r.read()
+        except (OSError, http.client.HTTPException):
+            conn.close()
+            local.conn = None
+            time.sleep(delay)
+            delay = min(10, delay * 1.5)
+            continue
+        if r.status == 429 or r.status >= 500:
+            time.sleep(delay)
+            delay = min(10, delay * 1.5)
+            continue
+        if r.status != 200:
+            raise RuntimeError(f"{r.status}: {data[:500]!r}")
+        return json.loads(data)
+
+
+def uuid_of(row: int) -> str:
+    """The deterministic UUID of a corpus row (the same function the engine's UUID tests use)."""
+    return str(uuid.UUID(int=((row + 1) * 0x9E3779B97F4A7C15F39CC0605CEDC835) % (1 << 128)))
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("data", type=Path)
+    p.add_argument("--base-url", default="http://127.0.0.1:18100")
+    p.add_argument("--namespace", default="nq")
+    p.add_argument("--rows", type=int, default=0, help="stop after this many rows (0: all)")
+    p.add_argument("--batch", type=int, default=5000)
+    p.add_argument("--inflight", type=int, default=4)
+    p.add_argument("--vectors-only", action="store_true")
+    p.add_argument(
+        "--skip", type=int, default=0, help="start at this row (rewrite the rows after it, as updates)"
+    )
+    p.add_argument(
+        "--title-suffix",
+        default="",
+        help="append this to every title, so rewritten rows differ (identical upserts are no-ops)",
+    )
+    p.add_argument("--id-kind", default="int", choices=["int", "uuid", "string"])
+    p.add_argument(
+        "--uuid-ids",
+        action="store_true",
+        help="write each ID as a UUID derived from the row number (schema id type uuid), for UUID-ID benchmarks",
+    )
+    a = p.parse_args()
+    path = f"/v2/namespaces/{a.namespace}"
+    vecs = np.load(a.data / "corpus.f16", mmap_mode="r")
+    if a.vectors_only:
+        total = a.rows or len(vecs)
+        files = [None]
+    else:
+        files = sorted((a.data / "raw" / "corpus").glob("*.parquet"))
+    schema = {"vector": SCHEMA["vector"]} if a.vectors_only else dict(SCHEMA)
+    if a.id_kind == "uuid":
+        schema["id"] = {"type": "uuid"}
+
+    def batches(f):
+        if f is None:
+            for s in range(0, total, a.batch):
+                yield min(a.batch, total - s)
+        else:
+            yield from pq.ParquetFile(f).iter_batches(batch_size=a.batch, columns=["title", "text"])
+
+    pool = ThreadPoolExecutor(a.inflight)
+    pending = []
+    row, t0, first = 0, time.monotonic(), True
+    for f in files:
+        for batch in batches(f):
+            n = batch if f is None else len(batch)
+            if row + n <= a.skip:
+                row += n
+                continue
+            if row < a.skip:
+                cut = a.skip - row
+                row, n = a.skip, n - cut
+                if f is not None:
+                    batch = batch.slice(cut)
+            if a.rows:
+                n = min(n, a.rows - row)
+            if n <= 0:
+                break
+            v = np.asarray(vecs[row : row + n], dtype="<f4")
+            ids = {"uuid": [uuid_of(i) for i in range(row, row + n)], "string": [f"nq:doc:{i:08d}" for i in range(row, row + n)], "int": list(range(row, row + n))}[a.id_kind]
+            cols = {"id": ids, "vector": [base64.b64encode(x.tobytes()).decode() for x in v]}
+            if f is not None:
+                cols["title"] = [t + a.title_suffix for t in batch.column("title").to_pylist()[:n]]
+                cols["text"] = batch.column("text").to_pylist()[:n]
+            body = {"upsert_columns": cols}
+            if first and not a.skip:
+                body["schema"] = schema
+                body["distance_metric"] = "cosine_distance"
+                post(a.base_url, path, json.dumps(body).encode())
+                first = False
+            elif first:
+                post(a.base_url, path, json.dumps(body).encode())
+                first = False
+            else:
+                pending.append(pool.submit(post, a.base_url, path, json.dumps(body).encode()))
+            row += n
+            while len(pending) >= a.inflight * 2:
+                pending.pop(0).result()
+            if row % 100_000 < a.batch:
+                el = time.monotonic() - t0
+                print(f"{row} rows {el:.0f}s {row / el:.0f} rows/s", flush=True)
+        if a.rows and row >= a.rows:
+            break
+    for x in pending:
+        x.result()
+    el = time.monotonic() - t0
+    row -= a.skip
+    print(json.dumps({"rows": row, "seconds": round(el, 1), "rows_per_s": round(row / el)}), flush=True)
+
+
+if __name__ == "__main__":
+    main()

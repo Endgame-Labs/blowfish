@@ -661,19 +661,67 @@ pub(crate) async fn live_masks(
     state: &NamespaceState,
     filter: Option<&Filter>,
 ) -> Result<Vec<Option<Arc<RoaringBitmap>>>, ApiError> {
+    if let Some(f) = filter {
+        return filtered_live_masks(store, state, f).await;
+    }
     futures::future::try_join_all(state.segments.iter().map(|seg| async move {
-        if let Some(f) = filter {
-            crate::filter::validate(f, &state.schema, false)?;
-            return Ok(Some(
-                segment::filter_live(store, seg, f, &state.schema).await?,
-            ));
-        }
         if seg.live_generation == 0 {
             return Ok(None);
         }
         Ok(Some(Arc::new(segment::live(store, seg).await?)))
     }))
     .await
+}
+
+/// Every segment's allowed rows under `f`, as one cached result. The filter and schema are
+/// serialized once for the whole namespace, and a repeat of the same filter on the same segments
+/// is one lookup, where resolving each segment on its own serialized the filter, the schema, and
+/// the segment's files again and took the decoded cache's lock once per segment. The segments'
+/// IDs, live generations, and live objects (immutable objects with unique keys) fence the entry.
+async fn filtered_live_masks(
+    store: &Storage,
+    state: &NamespaceState,
+    f: &Filter,
+) -> Result<Vec<Option<Arc<RoaringBitmap>>>, ApiError> {
+    use std::fmt::Write;
+    struct Masks(Vec<Option<Arc<RoaringBitmap>>>);
+    let filter_key = serde_json::to_string(&("live-masks-v1", f, &state.schema))
+        .map_err(segment::index_error)?;
+    let mut key = String::with_capacity(filter_key.len() + 64 * state.segments.len());
+    key.push_str(&filter_key);
+    for seg in state.segments.iter() {
+        let _ = write!(
+            key,
+            "|{}:{}:{}:{}:{}",
+            seg.id, seg.live_generation, seg.live.key, seg.live.size, seg.row_count
+        );
+    }
+    if let Some(hit) = read_cache::get::<Masks>(&key, 0) {
+        return Ok(hit.0.clone());
+    }
+    crate::filter::validate(f, &state.schema, false)?;
+    let masks = futures::future::try_join_all(state.segments.iter().map(|seg| async move {
+        Ok::<_, ApiError>(Some(
+            segment::filter_live(store, seg, f, &state.schema).await?,
+        ))
+    }))
+    .await?;
+    // The entry pins every mask, so it is charged for them even where the per-segment predicate
+    // cache has evicted its own copy.
+    let bytes = masks
+        .iter()
+        .flatten()
+        .map(|m| {
+            let s = m.statistics();
+            s.n_bytes_array_containers
+                + s.n_bytes_bitset_containers
+                + s.n_bytes_run_containers
+                + u64::from(s.n_containers) * 64
+        })
+        .sum::<u64>()
+        + (key.len() * 2 + masks.len() * 16 + 256) as u64;
+    read_cache::insert(&key, bytes, Masks(masks.clone()));
+    Ok(masks)
 }
 
 /// Pin the immutable predicate along with its derived counts, so its address cannot be
