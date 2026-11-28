@@ -4,6 +4,7 @@ Newest first. Each entry says what works now and how it was checked.
 
 ## 2026-11-28
 
+- **v0.1.82: C40 and T2 merged.** Cold leaf scans read exact byte ranges with a 64 KiB merge gap, cached per range, instead of 256 KiB blocks: on 10M rows on S3 a 7.9 percent filter reads 802 MB instead of 1,106 MB and runs 1.18 times faster cold, with identical results and no slower warm repeats. T2 found the root causes of four load-sensitive test failures (`docs/testing.md`). C41: cold BM25 is four serial S3 reads at a 23 ms floor, and a text hint cannot remove one (killed).
 - **v0.1.81: G26 merged.** The warm graph's paired recall check accepted the lowest effort on the sign of a 128-query mean (interval about plus or minus 0.022), so on BEIR NQ the graph served recall@10 of 0.943 to 0.949 against IVF's 0.961, below decision 29's requirement. A trial is now accepted only on a positive lower bound or a full 512-query window: the graph settles at `ef` 125, recall 0.965, about 18,400 q/s at `top_k` 10 on the M4, and promotion takes about 19 minutes instead of 2. The graph also serves `top_k` plus `offset` up to 256 (4.4 to 7.9 times IVF at higher recall).
 
 ## 2026-11-27
