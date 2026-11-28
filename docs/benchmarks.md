@@ -19464,8 +19464,8 @@ The candidate was faster in 261 of 300 pairs (paired ratio median 1.25). Tuning 
 180 identical, warm 0.944x), and 0.3 gave 1.274x (180 of 180, warm 0.926x), at nearly the same bytes (3,208 and 3,218 KB against 3,130 KB), so 0.3 shipped. The wave removed is
 the refinement: GETs drop by 68 per query and p50 by 30 ms, about one 24 ms floor plus its wave tail. **Pass: p50 at least 1.2x faster, identical results, warm not slower.**
 
-What is left is the chain manifest, bundle wave, one posting batch, and the 3 percent of segment-queries whose floor is under 0.3 of their best bound (they still pay
-the refinement). The remaining lever is the wave tails (the bundle wave's 62 reads finish about 20 ms after their median), not more waves.
+What is left is the chain manifest, bundle wave, and one posting batch, plus the refinement for the few queries (about 2.5 percent in the offline count) where a segment's floor is under 0.3 of
+its best bound. The remaining lever is the wave tails (the bundle wave's 62 reads finish about 20 ms after their median), not more waves.
 
 Resources: one on-demand c7gn.4xlarge for 0.4 hours (about $0.4 with the root volume), terminated; its key pair and security group are deleted; nothing was written to the
 bucket (the fixture was only read). Offline sizing ran on this VM.
