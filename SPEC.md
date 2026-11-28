@@ -108,7 +108,8 @@ log entry in the same commit.
   graph over rows in RAM, at idle priority, when measured heat pays for it, and serves unfiltered ANN from it only after
   paired recall checks against IVF pick a serving effort. It is never written to the bucket and never causes an object
   read during traversal; restart, eviction, or refusal falls back to IVF. There is no setting
-  (`docs/design/hot-tier-graph.md`).
+  (`docs/design/hot-tier-graph.md`). Filtered queries: up to 1 in 8 of the rows, a scan of the allowed rows' codes;
+  wider, a widened unfiltered walk with the filter applied to its beam (decision 32).
 - **BM25** (round 13): window-pruned posting reads (exact, not approximate), the term record stored before its
   blocks (text segment format v4), and text headers in the manifest. Result quality is checked as overlap@10 against
   exact BM25 (k1 1.2, b 0.75).
@@ -290,3 +291,4 @@ S3 until the run is cleaned up.
     builds a segment ANN index (Round CS1). Segment row caps stay as they are: fewer, larger segments were measured
     1.31 times slower on cold ID filters, because the cost is the depth of each segment's ID seek, not the number
     of segments.
+32. 2026-11-28: Round G27: a ready, calibrated warm graph answers a filter that allows more than 1 in 8 of its rows (`top_k` up to 10) by the unfiltered walk with a beam of 80 times `k` over the filter's share (at most 8,192), the filter applied to the beam, and the usual exact rerank; fewer than `k` survivors fall back to IVF. Narrower filters keep the code scan. It measured 2.4 to 2.7 times IVF's rate at higher recall on NQ.

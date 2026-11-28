@@ -304,14 +304,13 @@ fn from_tiers<'a>(
                         false
                     }
                 }
-                Some(allowed) => crate::warm_graph::scan_eligible(
-                    state,
-                    attribute,
-                    set,
-                    vector,
-                    graph_k,
-                    &filtered_tier_mask(set, at, allowed),
-                ),
+                Some(allowed) => {
+                    let m = filtered_tier_mask(set, at, allowed);
+                    crate::warm_graph::scan_eligible(state, attribute, set, vector, graph_k, &m)
+                        || crate::warm_graph::walk_eligible(
+                            state, attribute, set, vector, graph_k, &m,
+                        )
+                }
             };
             graph_tiers.push(enabled);
         }
@@ -801,14 +800,38 @@ async fn from_slabs(
     // is the filter's allowed rows for a filtered query, minus rows the tail shadows), so each
     // returns `k` live rows with no over-fetch.
     let accelerated = if let (true, Some(mask)) = (graph_expected && allowed.is_some(), &mask) {
-        if crate::warm_graph::scan_eligible(state, attribute, set, vector, k, mask) {
+        let walk = crate::warm_graph::walk_eligible(state, attribute, set, vector, k, mask);
+        let scan = crate::warm_graph::scan_eligible(state, attribute, set, vector, k, mask);
+        if walk || scan {
             let live = graph_mask(store, state, set, at, Some(mask)).await?;
             match live {
                 Some(live) => {
-                    crate::warm_graph::scan(
-                        store, state, attribute, set, at, vector, live, k, columns,
-                    )
-                    .await?
+                    let walked = if walk {
+                        crate::warm_graph::walk(
+                            store,
+                            state,
+                            attribute,
+                            set,
+                            at,
+                            vector,
+                            live.clone(),
+                            k,
+                            columns,
+                        )
+                        .await?
+                    } else {
+                        None
+                    };
+                    match walked {
+                        Some(found) => Some(found),
+                        None if scan => {
+                            crate::warm_graph::scan(
+                                store, state, attribute, set, at, vector, live, k, columns,
+                            )
+                            .await?
+                        }
+                        None => None,
+                    }
                 }
                 None => None,
             }

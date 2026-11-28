@@ -1227,6 +1227,124 @@ pub(crate) fn scan_eligible(
                 && allowed.len().saturating_mul(SCAN_SHARE as u64) <= e.graph.len() as u64
         })
 }
+/// The beam of a post-filter walk is this many times `k / share`, where `share` is the allowed rows'
+/// share of the graph. Round G27 measured full NQ at `k` 10: 40 gives recall@10 0.988 (50 percent
+/// filter) and 0.993 (20 percent) against IVF's 0.983 and 0.994, and 80 gives 0.993 and 0.995, so 80
+/// is the first setting at or above IVF's recall on both, at 2.4 to 2.7 times IVF's rate.
+const WALK_BEAM_PER_ROW: f64 = 80.;
+/// The widest beam of a post-filter walk (80 times `k` 10 at the 1-in-8 share is 6,400).
+const WALK_BEAM_MAX: usize = 8192;
+/// The most rows a post-filter walk is measured for.
+const WALK_MAX_K: usize = 10;
+/// The beam of a post-filter walk for `k` wanted rows when `allowed` of `rows` are allowed, or
+/// `None` when the filter is narrow enough (under 1 in `SCAN_SHARE`) for the code scan to answer.
+fn walk_beam(k: usize, allowed: u64, rows: usize, calibrated: usize) -> Option<usize> {
+    if k == 0 || k > WALK_MAX_K || allowed.saturating_mul(SCAN_SHARE as u64) <= rows as u64 {
+        return None;
+    }
+    let beam = (WALK_BEAM_PER_ROW * k as f64 * rows as f64 / allowed as f64).ceil() as usize;
+    Some(beam.clamp(calibrated, WALK_BEAM_MAX.max(calibrated)))
+}
+/// Whether a ready graph may answer a filtered query by the unfiltered walk, post-filtered.
+pub(crate) fn walk_eligible(
+    state: &NamespaceState,
+    attribute: &str,
+    set: &SlabSet,
+    vector: &[f32],
+    k: usize,
+    allowed: &RoaringBitmap,
+) -> bool {
+    if overcommitted() || allowed.is_empty() {
+        return false;
+    }
+    let Some(scope) = current() else {
+        return false;
+    };
+    scope
+        .cache
+        .ready(&scope.namespace, state, attribute, set)
+        .is_some_and(|e| {
+            let c = e.calibration.lock().unwrap_or_else(|e| e.into_inner());
+            c.usable
+                && k > 0
+                && e.graph.len() >= k
+                && vector.len() == e.graph.dims()
+                && vector.iter().any(|x| *x != 0.)
+                && walk_beam(
+                    k,
+                    allowed.len(),
+                    e.graph.len(),
+                    c.quality.serving.unwrap_or(c.quality.trial),
+                )
+                .is_some()
+        })
+}
+/// Answer a filtered query from the unfiltered walk: a beam widened by the filter's share, the
+/// filter applied to the beam, the survivors reranked exactly. `None` when fewer than `k`
+/// survive, so the caller takes the filtered path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn walk(
+    store: &Storage,
+    state: &NamespaceState,
+    attribute: &str,
+    set: &SlabSet,
+    at: &Placement,
+    vector: &[f32],
+    mask: Arc<RoaringBitmap>,
+    k: usize,
+    columns: &BTreeSet<String>,
+) -> Result<Option<(BTreeMap<Id, f64>, BTreeMap<Id, Document>)>, ApiError> {
+    let Some(scope) = current() else {
+        return Ok(None);
+    };
+    let Some(entry) = scope.cache.ready(&scope.namespace, state, attribute, set) else {
+        return Ok(None);
+    };
+    let ef = {
+        let c = entry.calibration.lock().unwrap_or_else(|e| e.into_inner());
+        if !c.usable {
+            return Ok(None);
+        }
+        match walk_beam(
+            k,
+            mask.len(),
+            entry.graph.len(),
+            c.quality.serving.unwrap_or(c.quality.trial),
+        ) {
+            Some(ef) => ef,
+            None => return Ok(None),
+        }
+    };
+    let Ok(_permit) = entry.slots.try_acquire() else {
+        return Ok(None);
+    };
+    match search_entry(
+        store,
+        state,
+        set,
+        at,
+        vector,
+        Some(mask),
+        k,
+        columns,
+        &entry,
+        ef,
+        false,
+    )
+    .await
+    {
+        Ok(found) => {
+            if found.is_some() {
+                scope.cache.answers.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(found)
+        }
+        Err(error) => {
+            tracing::debug!(%error, "warm graph walk declined");
+            Ok(None)
+        }
+    }
+}
 /// Answer a filtered query from the ready graph's codes: score only the `mask` rows, keep the
 /// best few by SQ8 distance, and rerank them exactly. `None` when the graph cannot answer.
 #[allow(clippy::too_many_arguments)]
