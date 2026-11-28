@@ -19005,6 +19005,86 @@ No format version, stripe writer, or reader change; no engine change (`ann_dir.r
 
 One c7gn.4xlarge on demand for about 1.2 hours (about $1.0), plus the 77 GB server-side copy (deleted): about $1.1 in all. The instance, key pair, security group, and the S3 prefix `tmp/c39` are deleted (no multipart uploads).
 
+## Round C40: cold leaf scans read exact ranges, not 256 KiB blocks (7.9 percent filter 1.18 times, 0.64 percent 1.03 times, `text_length` 1.06 times), identical results
+
+The brief's pass bar (7.9 percent filter at least 1.10 times faster cold, identical results, nothing slower warm or unfiltered by more than 3 percent) is **met**: the 7.9 percent filter is **0.850**
+(95 percent interval 0.808 to 0.879, p50 694.7 to 590.4 ms), and all 320 cold pairs and 320 warm pairs return identical ordered IDs and f64 distance bits. The unfiltered control is 0.959 cold
+(interval 0.859 to 1.068) and 1.011 warm (0.964 to 1.060), at parity. An A/A control (baseline twice, 40 pairs) is 1.005 cold (0.939 to 1.094) and 0.986 warm. No file format, setting, or fixture changed.
+
+Measured 2026-11-28 on one on-demand c7gn.4xlarge (us-west-2), baseline `bfe266d` (v0.1.79) against the candidate, on a private server-side copy of the retained C5 checkpoint repaired by the baseline writer (55
+row maps, manifest 906, about 12 minutes of writable serving). Protocol as C38: read-only servers, 8 Rayon workers, 64 probes, strong consistency, IDs only, 256 KiB blocks, 32-block coalescing, zero disk
+cache, a full engine-cache drop before every cold request, arms alternating AB/BA, one untimed warm-up, 80 pairs per case. New in the harness (`cold_ab.py --warm-repeats 2`): after each cold request the same
+query runs twice more with no drop, recorded as arm `NAME~warm`, so warm repeats are paired the same way. Release builds target `neoverse-v1` with frame pointers.
+
+### The change
+
+One scan read path, no setting (SPEC 25), no format change:
+
+1. **`bf-storage` reads and caches exact ranges** (`RangeReader::read_exact_batch_with_stats` and `read_exact_batch_notifying`). A missing range is fetched alone, or merged with its neighbors when
+   the gap is at most 64 KiB and the read stays within 8 MiB (the gap bytes are dropped). Every range is cached under its own span (memory, and disk like a block: block names are unchanged, so an
+   existing disk cache stays valid), so a repeat of the same read is a hit however the ranges merged. Misses are single-flighted per range, as block misses are, so a read that starts while another
+   reserved the same range attaches to it. A range whose blocks are all in memory is served from them, and `is_memory_resident` now also sees ranges cached whole.
+2. **The leaf scan asks for exact ranges** (`ann_dir::read_clusters`, through `bf_vector::read_merged_exact` and `RangeRead::read_batch_exact`; the merge gap is 64 KiB instead of 16 KiB).
+3. **So do the two reads that run ahead of it.** The scan is not the only reader of a leaf's range: the speculative leaf reads that start before the WAL check (`speculate_leaf_reads`) and the streaming
+   seed reads (`search`, split into 64 KiB pieces for filtered queries) filled the block cache first, and the scan then found its bytes there. A first version that changed only the scan read **1,738 MB in
+   7,266 GETs** (baseline 1,095 MB and 1,080), because those early reads kept fetching blocks while the scan fetched exact ranges beside them (7.9 percent filter: 883.8 against 689.7 ms p50 over 6 pairs). Moving both to
+   exact ranges with the same per-leaf ranges as the scan, and giving exact ranges single-flight, fixed it, and `seed_pieces` is gone.
+
+What still reads blocks: the directory, row maps, and routing; the rerank's vectors and documents; and the old-format (`codes_in_fragment` false) segment path, whose codes go through `Index::read_codes`.
+
+### Acceptance (80 cold pairs per case, 40 for the control; ratio is candidate over base p50, with the paired-resample 95 percent interval)
+
+| Case | Base p50 / p90, ms | Candidate p50 / p90, ms | Ratio (95%) | GETs base / cand | MB base / cand | Exact |
+| --- | ---: | ---: | ---: | ---: | ---: | :-: |
+| A/A control (baseline twice), 7.9% filter | 686.8 / 763.7 | 690.5 / 824.0 | 1.005 (0.939-1.094) | 1,082 / 1,083 | 1,108.9 / 1,108.9 | yes |
+| 7.9% filter (`title_initial = s`) | 694.7 / 821.6 | 590.4 / 753.5 | **0.850** (0.808-0.879) | 1,085 / 1,950 | 1,106.3 / 801.7 | yes |
+| 0.64% filter (`title_initial = z`) | 736.3 / 926.4 | 718.2 / 851.0 | 0.975 (0.928-1.005) | 854 / 2,760 | 1,638.2 / 1,273.1 | yes |
+| `text_length >= 300` | 513.9 / 697.0 | 482.6 / 555.0 | 0.939 (0.888-0.994) | 654 / 804 | 379.6 / 289.7 | yes |
+| Control: unfiltered `top_k` 10 | 202.2 / 260.3 | 193.9 / 246.0 | 0.959 (0.859-1.068) | 289 / 335 | 95.8 / 57.7 | yes |
+
+Warm repeats (the same query, caches kept; 80 pairs per case, the second repeat of each):
+
+| Case | Base p50 / p90, ms | Candidate p50 / p90, ms | Ratio (95%) | Bytes read |
+| --- | ---: | ---: | ---: | ---: |
+| A/A control, 7.9% filter | 48.1 / 50.9 | 47.4 / 50.3 | 0.986 (0.958-1.006) | 0 |
+| 7.9% filter | 47.5 / 50.2 | 44.6 / 46.7 | 0.938 (0.923-0.950) | 0 |
+| 0.64% filter | 40.2 / 44.1 | 32.0 / 35.1 | 0.796 (0.778-0.812) | 0 |
+| `text_length >= 300` | 46.7 / 49.4 | 45.9 / 49.5 | 0.983 (0.971-0.993) | 0 |
+| Control: unfiltered `top_k` 10 | 20.2 / 25.2 | 20.4 / 25.2 | 1.011 (0.964-1.060) | 0 |
+
+**Decision on the warm repeat:** exact ranges do not bypass the cache, they are what the cache holds, so a repeat hits (zero bytes, zero GETs) and is no slower; the filtered repeats are 2 to 20 percent faster (not traced; the repeat's own work is the CPU scan and rerank). The 7.9 percent bytes fall 27.5 percent (1,106 to 802 MB; the 649 MB of C39's model plus about 150 MB of row maps, directory, and rerank reads
+that are not leaf ranges) for 865 more GETs (model: 816), the 0.64 percent filter 22 percent for 1,900 more, and the unfiltered query 40 percent. The model's saving (110 and 135 ms) is realized in full only for
+the 7.9 percent filter (104 ms); the 0.64 percent filter needs 3.2 times the GETs (2,760 against the model's 2,212 for the scan alone), so its 18 ms (2.5 percent, interval to 1.005) is within noise: more requests ate most of the 365 MB saved.
+
+### Optional estimate: a triangle bound over code blocks (Sol 05:25 #4) skips none (`c40_tri.py`)
+
+Idea: store each 32-row block's [min, max] distance to a few shared pivots, and skip a block whose bound exceeds the k-th distance once the first leaves supply it. The hook of C39 was not re-applied: the test
+needs exact vectors, which the retained NQ fixture has. The first 600,000 rows of the NQ fixture (1,024-d, cosine, normalized) were put in 980 k-means leaves of about 612 rows (rows in original order
+inside a leaf, as in the index); 40 queries probed the nearest 40 percent of leaves (6,179 of 15,611 at 7.9 percent); a random 7.9 percent of rows matched; the cutoff was the **true** 10th filtered distance
+(the best case, with no extra wave to find it). Bound per block is the largest of `d(q,p) - max d(x,p)` and `min d(x,p) - d(q,p)` over the pivots.
+
+| Pivots per block | Blocks skippable | Leaves wholly skippable | Largest bound / cutoff | Mean bound / cutoff |
+| --- | ---: | ---: | ---: | ---: |
+| Own leaf center (1) | 0.0000 | 0.0000 | 0.505 | 0.170 |
+| Own center plus 3 nearest leaf centers (4) | 0.0000 | 0.0000 | 0.505 | 0.170 |
+| Own center plus 15 nearest leaf centers (16) | 0.0000 | 0.0000 | 0.505 | 0.170 |
+| 4 global random rows | 0.0000 | 0.0000 | 0.304 | 0.077 |
+| 16 global random rows | 0.0000 | 0.0000 | 0.304 | 0.097 |
+
+**Killed:** no block of any query is skippable, and the best bound reaches half the cutoff. The cutoff itself is 1.338 (unit vectors; a random pair is 1.414), so distances concentrate and `|d(q,p) - d(x,p)|`
+is small against the k-th distance. The kill rule of the idea (over 450 MB of aligned reads left even at the true cutoff) is met at 100 percent. Caveats: NQ vectors rather than the 10M fixture's, and a k-means
+leaf layout rather than the engine's; a 10M corpus has a lower k-th distance, but not by half.
+
+### Tests
+
+New: `bf-storage` `exact_ranges_fetch_only_their_bytes_merge_small_gaps_and_repeat_from_cache` (fetched ranges, merge gap and size cap, hit on repeat, stats), `exact_ranges_use_blocks_that_are_already_in_memory`,
+and `concurrent_exact_reads_of_one_range_share_one_request` (the notifying variant). `read_cache::cold_ann_over_twenty_segments_uses_the_directory` fixes its scan wave at 22 requests (it was 23 with blocks:
+this fixture's exact ranges merge one request better); it stays within 3 read rounds, and it passed three runs in a row. Scripts: `c40_pairs.sh` (the paired runs), `cold_ab.py --warm-repeats`, and `c40_tri.py`.
+
+### Cost
+
+One c7gn.4xlarge on demand (06:23 to 07:49 UTC, 1.4 hours: about $1.7 with the 77 GB server-side copy, which is deleted). The instance, key pair, security group, and the S3 prefix `tmp/c40` are deleted.
+
 ## Round G24: multi-entry beam seeding and a raw-text query parse (M4): neither is shipped, 1.03 times at `top_k` 10 for 0.003 of recall
 
 **Setup:** Round G23's: the Apple M4 (shared Mac mini, 10 cores), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), the frozen v0.1.19 fixture, release binaries, indexing off, the graph promoted the ordinary way (`g15_promote.py`), IDs only, the native driver (`native_drive`, 16 connections, 20 seconds per arm). Every pair of arms ran on **one promoted server** of a candidate binary with a temporary switch file (read every 250 ms, not in the tree). The effort controller settled at `ef` 64 on the first server and 80 on the second, so compare arms within a server only. Both candidates were reverted before this commit: the tree's code is main's (a3f1606), and the candidate commits stay in the branch history (031f5e5 for the parse, 7c9d535 and 63eb2f5 for the seeding).

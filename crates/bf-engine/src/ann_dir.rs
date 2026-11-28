@@ -22,8 +22,9 @@ const EXACT_ROWS: usize = 2048;
 /// Never hold more than this many bytes of exact vectors for one query.
 const EXACT_BYTES: usize = 256 << 20;
 
-/// Merge nearby leaf blocks, which hold blobs and codes together.
-const BLOCK_GAP: u64 = 16 << 10;
+/// Merge leaf ranges (blobs and codes) at most this far apart: the gap is fetched and dropped.
+/// The scan reads and caches exact ranges, not 256 KiB cache blocks (Round C40).
+const BLOCK_GAP: u64 = 64 << 10;
 
 /// Read the blobs of `entries` (one segment's probed clusters) and, unless `exact`, their
 /// quantized codes from the same ANN object.
@@ -52,7 +53,7 @@ async fn read_clusters(
         if !exact {
             ranges.extend(entries.iter().map(|e| e.codes_range()));
         }
-        let mut all = bf_vector::read_merged(
+        let mut all = bf_vector::read_merged_exact(
             fragment,
             ranges,
             bf_vector::read_gap(BLOCK_GAP),
@@ -74,24 +75,6 @@ fn vector_pieces(
         let mut start = r.start;
         while start < r.end {
             let end = (start + PREFETCH_PIECE).min(r.end);
-            out.push(start..end);
-            start = end;
-        }
-    }
-    out
-}
-
-/// Seeding needs cached blocks, not assembled cluster buffers. Splitting on small aligned
-/// boundaries lets the range cache return borrowed block slices instead of copying every
-/// large code range into a buffer that the seed task immediately discards. The cache still
-/// coalesces the same missing blocks into the same backend reads.
-fn seed_pieces(ranges: Vec<std::ops::Range<u64>>) -> Vec<std::ops::Range<u64>> {
-    const PIECE: u64 = 64 << 10;
-    let mut out = Vec::new();
-    for range in ranges {
-        let mut start = range.start;
-        while start < range.end {
-            let end = start.saturating_add(PIECE - start % PIECE).min(range.end);
             out.push(start..end);
             start = end;
         }
@@ -411,7 +394,15 @@ fn speculate_leaf_reads(
             let stats = stats.clone();
             tokio::spawn(async move {
                 let (ready, _) = tokio::sync::oneshot::channel();
-                let _ = reader.read_batch_notifying(&ranges, &stats, ready).await;
+                let _ = reader
+                    .read_exact_batch_notifying(
+                        &ranges,
+                        bf_vector::read_gap(BLOCK_GAP),
+                        BLOB_MERGE_MAX,
+                        &stats,
+                        ready,
+                    )
+                    .await;
             });
         }
     }
@@ -1611,11 +1602,6 @@ pub(crate) async fn search(
                     continue;
                 }
                 locally_staged = false;
-                let ranges = if filtered {
-                    seed_pieces(ranges)
-                } else {
-                    ranges
-                };
                 let reader = store
                     .range_reader_with_length(&file.key, file.size, true)
                     .map_err(segment::index_error)?;
@@ -1623,7 +1609,15 @@ pub(crate) async fn search(
                 let (ready, reserved) = tokio::sync::oneshot::channel();
                 reservations.push(reserved);
                 bulk.spawn(async move {
-                    let _ = reader.read_batch_notifying(&ranges, &stats, ready).await;
+                    let _ = reader
+                        .read_exact_batch_notifying(
+                            &ranges,
+                            bf_vector::read_gap(BLOCK_GAP),
+                            BLOB_MERGE_MAX,
+                            &stats,
+                            ready,
+                        )
+                        .await;
                 });
             }
         }

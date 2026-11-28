@@ -33,7 +33,7 @@ pub use directory::{
 pub use format::{ANN_FORMAT_VERSION, FORMAT_VERSION, metadata_len};
 pub use index::{
     Candidate, DecodedCluster, Index, RotatedQuery, ScanScratch, SearchParams, read_gap,
-    read_merged,
+    read_merged, read_merged_exact,
 };
 pub use reader::RangeRead;
 #[cfg(feature = "legacy-fixtures")]

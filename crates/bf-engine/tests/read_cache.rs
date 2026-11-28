@@ -824,12 +824,12 @@ async fn cold_ann_over_twenty_segments_uses_the_directory() {
         backend.reset_waves();
         backend.ranges.lock().unwrap().clear();
         backend.paths.lock().unwrap().clear();
-        // This fixed fixture issues three directory hints, 23 parallel scan and column
+        // This fixed fixture issues three directory hints, 22 parallel scan and column
         // prefetch reads, and 14 rerank and winner-column reads. Holding each whole batch
         // proves that the query needs at most three sequential read rounds. In particular,
         // a fourth dependent read round cannot sneak through because a CPU stall split a
         // timing window. The generous timeout only detects a blocked or changed plan.
-        let rounds = Arc::new(ReadRounds::new(&[3, 23, 14]));
+        let rounds = Arc::new(ReadRounds::new(&[3, 22, 14]));
         *backend.read_rounds.lock().unwrap() = Some(rounds.clone());
         let cold = tokio::time::timeout(
             Duration::from_secs(120),

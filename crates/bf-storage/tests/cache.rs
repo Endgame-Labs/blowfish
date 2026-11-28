@@ -755,3 +755,115 @@ async fn memory_residency_is_advisory_and_per_range() {
     assert!(reader.is_memory_resident(0..64));
     assert!(!reader.is_memory_resident(0..65));
 }
+
+#[tokio::test]
+async fn exact_ranges_fetch_only_their_bytes_merge_small_gaps_and_repeat_from_cache() {
+    let (store, backend, data) = setup(CacheConfig {
+        memory_bytes: 1 << 20,
+        ..config()
+    })
+    .await;
+    let reader = store.range_reader("object").await.unwrap();
+    backend.ranges.lock().unwrap().clear();
+    let stats = CacheStats::default();
+    // 100..130 and 140..160 are 10 apart (merged under a gap of 16); 400..410 is far; the
+    // duplicate and the empty range come back in input order.
+    let wanted = [140..160, 400..410, 100..130, 400..410, 7..7];
+    let got = reader
+        .read_exact_batch_with_stats(&wanted, 16, 1 << 20, &stats)
+        .await
+        .unwrap();
+    for (range, bytes) in wanted.iter().zip(&got) {
+        assert_eq!(bytes, &data.slice(range.start as usize..range.end as usize));
+    }
+    let mut fetched = ranges(&backend);
+    fetched.sort_by_key(|r| r.start);
+    assert_eq!(fetched, vec![100..160, 400..410]);
+    assert_eq!(stats.snapshot().missed_bytes, 30 + 20 + 10);
+    // The same read again, and any sub-merge of it, is served from the exact pieces.
+    let again = CacheStats::default();
+    let got2 = reader
+        .read_exact_batch_with_stats(&[100..130, 140..160], 0, 1 << 20, &again)
+        .await
+        .unwrap();
+    assert_eq!(got2[0], data.slice(100..130));
+    assert_eq!(got2[1], data.slice(140..160));
+    assert_eq!(ranges(&backend).len(), 2);
+    assert_eq!(again.snapshot().missed_bytes, 0);
+    assert_eq!(again.snapshot().memory_bytes, 50);
+    // A merged read never exceeds `max`.
+    backend.ranges.lock().unwrap().clear();
+    reader
+        .read_exact_batch_with_stats(&[600..620, 630..650, 660..680], 16, 50, &stats)
+        .await
+        .unwrap();
+    let mut fetched = ranges(&backend);
+    fetched.sort_by_key(|r| r.start);
+    assert_eq!(fetched, vec![600..650, 660..680]);
+    assert!(
+        reader
+            .read_exact_batch_with_stats(
+                std::slice::from_ref(&(0..data.len() as u64 + 1)),
+                0,
+                1,
+                &stats
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn exact_ranges_use_blocks_that_are_already_in_memory() {
+    let (store, backend, data) = setup(CacheConfig {
+        memory_bytes: 1 << 20,
+        ..config()
+    })
+    .await;
+    let reader = store.range_reader("object").await.unwrap();
+    reader.read(0..256).await.unwrap();
+    backend.ranges.lock().unwrap().clear();
+    let got = reader
+        .read_exact_batch_with_stats(
+            std::slice::from_ref(&(10..200)),
+            0,
+            1 << 20,
+            &CacheStats::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got[0], data.slice(10..200));
+    assert!(ranges(&backend).is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_exact_reads_of_one_range_share_one_request() {
+    let (store, backend, data) = setup(CacheConfig {
+        memory_bytes: 1 << 20,
+        ..config()
+    })
+    .await;
+    let reader = store.range_reader("object").await.unwrap();
+    backend.ranges.lock().unwrap().clear();
+    backend.delay.store(true, Ordering::SeqCst);
+    let (ready, reserved) = tokio::sync::oneshot::channel();
+    let (stats_a, stats_b) = (CacheStats::default(), CacheStats::default());
+    let wanted = [300..420, 500..520];
+    let first = reader.read_exact_batch_notifying(&wanted, 0, 1 << 20, &stats_a, ready);
+    let second = async {
+        // Starts after the first reserved its misses: it must attach to them, not refetch.
+        reserved.await.unwrap();
+        reader
+            .read_exact_batch_with_stats(&[500..520, 300..420], 0, 1 << 20, &stats_b)
+            .await
+    };
+    let (a, b) = tokio::join!(first, second);
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(a[0], data.slice(300..420));
+    assert_eq!(b[0], data.slice(500..520));
+    assert_eq!(b[1], data.slice(300..420));
+    let mut fetched = ranges(&backend);
+    fetched.sort_by_key(|r| r.start);
+    assert_eq!(fetched, vec![300..420, 500..520]);
+    assert!(reader.is_memory_resident(300..420));
+}

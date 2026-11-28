@@ -1503,6 +1503,30 @@ pub async fn read_merged<R: RangeRead>(
     merged(reader, ranges, gap, max, false).await
 }
 
+/// [`read_merged`] for a leaf scan: a block-caching reader reads and caches exactly these
+/// ranges (see [`RangeRead::read_batch_exact`]) instead of whole cache blocks. Other readers
+/// merge as `read_merged` does.
+pub async fn read_merged_exact<R: RangeRead>(
+    reader: &R,
+    ranges: Vec<Range<u64>>,
+    gap: u64,
+    max: u64,
+) -> Result<Vec<Bytes>> {
+    if !reader.caches_blocks() {
+        return merged(reader, ranges, gap, max, false).await;
+    }
+    let bytes = reader.read_batch_exact(ranges.clone(), gap, max).await?;
+    if bytes.len() != ranges.len()
+        || bytes
+            .iter()
+            .zip(&ranges)
+            .any(|(b, r)| b.len() as u64 != r.end - r.start)
+    {
+        return Err(bad("short or incomplete batch read"));
+    }
+    Ok(bytes)
+}
+
 async fn merged<R: RangeRead>(
     reader: &R,
     ranges: Vec<Range<u64>>,
