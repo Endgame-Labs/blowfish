@@ -847,14 +847,14 @@ async fn concurrent_exact_reads_of_one_range_share_one_request() {
     backend.ranges.lock().unwrap().clear();
     backend.delay.store(true, Ordering::SeqCst);
     let (ready, reserved) = tokio::sync::oneshot::channel();
+    let (stats_a, stats_b) = (CacheStats::default(), CacheStats::default());
     let wanted = [300..420, 500..520];
-    let first =
-        reader.read_exact_batch_notifying(&wanted, 0, 1 << 20, &CacheStats::default(), ready);
+    let first = reader.read_exact_batch_notifying(&wanted, 0, 1 << 20, &stats_a, ready);
     let second = async {
         // Starts after the first reserved its misses: it must attach to them, not refetch.
         reserved.await.unwrap();
         reader
-            .read_exact_batch_with_stats(&[500..520, 300..420], 0, 1 << 20, &CacheStats::default())
+            .read_exact_batch_with_stats(&[500..520, 300..420], 0, 1 << 20, &stats_b)
             .await
     };
     let (a, b) = tokio::join!(first, second);
