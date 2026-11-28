@@ -22,8 +22,9 @@ const EXACT_ROWS: usize = 2048;
 /// Never hold more than this many bytes of exact vectors for one query.
 const EXACT_BYTES: usize = 256 << 20;
 
-/// Merge nearby leaf blocks, which hold blobs and codes together.
-const BLOCK_GAP: u64 = 16 << 10;
+/// Merge leaf ranges (blobs and codes) at most this far apart: the gap is fetched and dropped.
+/// The scan reads and caches exact ranges, not 256 KiB cache blocks (Round C40).
+const BLOCK_GAP: u64 = 64 << 10;
 
 /// Read the blobs of `entries` (one segment's probed clusters) and, unless `exact`, their
 /// quantized codes from the same ANN object.
@@ -52,7 +53,7 @@ async fn read_clusters(
         if !exact {
             ranges.extend(entries.iter().map(|e| e.codes_range()));
         }
-        let mut all = bf_vector::read_merged(
+        let mut all = bf_vector::read_merged_exact(
             fragment,
             ranges,
             bf_vector::read_gap(BLOCK_GAP),

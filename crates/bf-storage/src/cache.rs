@@ -170,6 +170,8 @@ struct BlockKey {
     len: u64,
     /// Block size of a sparse reader's small blocks, or 0 for the configured block size.
     small: u32,
+    /// Length of an exact range cached whole (its start is `index`), or 0 for a block.
+    span: u64,
 }
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Layout {
@@ -276,7 +278,7 @@ impl RangeCache {
     }
     fn disk_key(&self, key: &BlockKey) -> String {
         digest(format!(
-            "{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}{}",
             if key.small > 0 {
                 key.small as usize
             } else {
@@ -286,7 +288,13 @@ impl RangeCache {
             key.len,
             key.index,
             key.path.len(),
-            key.path
+            key.path,
+            // Blocks keep their original names, so existing disk caches stay valid.
+            if key.span > 0 {
+                format!(":x{}", key.span)
+            } else {
+                String::new()
+            }
         ))
     }
     /// Look up blocks in memory, then on disk, with no cache-wide lock held. Disk reads are
@@ -364,6 +372,43 @@ impl RangeCache {
             }
             idle.await;
         }
+    }
+    /// Whether another disk write may start behind a read. On a cold cache the disk is slower
+    /// than the network, and an unbounded backlog would hold every fetched block in memory. A
+    /// skipped write only means that block is fetched again later.
+    fn spill_has_room(&self) -> bool {
+        const MAX_SPILLS: usize = 16;
+        self.disk.is_some()
+            && self
+                .spills
+                .pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+                < MAX_SPILLS
+    }
+    /// Write fetched values to the disk tier behind the read: a block-by-block write that the
+    /// read awaited cost about a millisecond per 4 KB block, which made a cold 2 MB read take
+    /// half a second after the network transfer had finished.
+    fn spill_to_disk(&self, spill: Vec<(String, Bytes)>) {
+        let Some(disk) = self.disk.clone().filter(|_| !spill.is_empty()) else {
+            return;
+        };
+        let spills = self.spills.clone();
+        spills
+            .pending
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::task::spawn_blocking(move || {
+            {
+                let mut disk = disk.lock().unwrap();
+                for (name, value) in spill {
+                    // A full or damaged cache never makes source-of-truth reads fail.
+                    let _ = disk.insert(&name, &value);
+                }
+            }
+            spills
+                .pending
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            spills.idle.notify_waiters();
+        });
     }
     fn insert_memory(&self, key: BlockKey, value: Bytes) {
         if value.len() as u64 > self.config.memory_bytes || self.config.memory_bytes == 0 {
@@ -523,6 +568,162 @@ impl RangeReader {
         stats: &CacheStats,
     ) -> Result<Vec<Bytes>, Error> {
         self.read_batch_inner(ranges, stats, None).await
+    }
+    /// Read ranges that are cached and fetched exactly as asked, not in whole blocks.
+    ///
+    /// For a scan whose ranges are known and dense in neither direction (a cold leaf scan:
+    /// thousands of 70 KB ranges scattered over a multi-gigabyte object), whole-block fetches
+    /// read about a third more bytes than the ranges hold. Each missing range is fetched alone,
+    /// or merged with its neighbors when the gap between them is at most `gap` bytes and the
+    /// merged read stays within `max` bytes (the gap bytes are dropped). Every range is then
+    /// cached under its own exact span, in memory and on disk like a block, so a repeat of the
+    /// same read is a hit however the ranges merged. A range whose blocks are all in memory
+    /// (read earlier by block readers) is served from them. Concurrent identical misses are not
+    /// shared the way block misses are: each fetches its own copy.
+    pub async fn read_exact_batch_with_stats(
+        &self,
+        ranges: &[Range<u64>],
+        gap: u64,
+        max: u64,
+        stats: &CacheStats,
+    ) -> Result<Vec<Bytes>, Error> {
+        let cache = &self.storage.0.cache;
+        if cache.mapped.get().is_some() {
+            return self.read_batch_with_stats(ranges, stats).await;
+        }
+        let mut distinct = BTreeMap::<(u64, u64), usize>::new();
+        for range in ranges {
+            if range.start > range.end || range.end > self.len() {
+                return Err(Error::Config("invalid object range"));
+            }
+            if !range.is_empty() {
+                distinct.insert((range.start, range.end), 0);
+            }
+        }
+        for (position, slot) in distinct.values_mut().enumerate() {
+            *slot = position;
+        }
+        let spans: Vec<Range<u64>> = distinct.keys().map(|&(s, e)| s..e).collect();
+        let wanted: Vec<_> = spans
+            .iter()
+            .map(|r| (self.exact_key(r), (r.end - r.start) as usize))
+            .collect();
+        let looked_up = cache.lookup_many(&wanted, self.admit).await;
+        let mut pieces: Vec<Option<Bytes>> = vec![None; spans.len()];
+        let (mut memory, mut disk, mut memory_pieces, mut disk_pieces) = (0, 0, 0, 0);
+        let mut missing = Vec::new();
+        for (i, found) in looked_up.into_iter().enumerate() {
+            let weight = spans[i].end - spans[i].start;
+            match found {
+                Some((bytes, Tier::Memory)) => {
+                    memory += weight;
+                    memory_pieces += 1;
+                    pieces[i] = Some(bytes);
+                }
+                Some((bytes, _)) => {
+                    disk += weight;
+                    disk_pieces += 1;
+                    pieces[i] = Some(bytes);
+                }
+                None => missing.push(i),
+            }
+        }
+        stats.record_many(Tier::Memory, memory, memory_pieces);
+        stats.record_many(Tier::Disk, disk, disk_pieces);
+        // Ranges that block readers already hold in memory cost nothing to serve from there.
+        let (resident, missing): (Vec<usize>, Vec<usize>) = missing
+            .into_iter()
+            .partition(|&i| self.is_memory_resident(spans[i].clone()));
+        if !resident.is_empty() {
+            let from_blocks: Vec<_> = resident.iter().map(|&i| spans[i].clone()).collect();
+            let bytes = self.read_batch_with_stats(&from_blocks, stats).await?;
+            for (i, bytes) in resident.into_iter().zip(bytes) {
+                pieces[i] = Some(bytes);
+            }
+        }
+        // `missing` is in start order (the map's key order). Merge, then fetch every group.
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for i in missing {
+            stats.record(Tier::Miss, spans[i].end - spans[i].start);
+            match groups.last_mut() {
+                Some(group)
+                    if {
+                        let first = &spans[group[0]];
+                        let end = group.iter().map(|&j| spans[j].end).max().unwrap_or(0);
+                        spans[i].start <= end.saturating_add(gap)
+                            && spans[i].end.max(end) - first.start <= max
+                    } =>
+                {
+                    group.push(i);
+                }
+                _ => groups.push(vec![i]),
+            }
+        }
+        let spilling = self.admit && cache.spill_has_room();
+        let fetched = futures::future::try_join_all(groups.into_iter().map(|group| {
+            let spans = &spans;
+            async move {
+                let from = spans[group[0]].start;
+                let to = group.iter().map(|&i| spans[i].end).max().unwrap_or(from);
+                let _permit = cache
+                    .fetches
+                    .acquire()
+                    .await
+                    .expect("cache semaphore stays open");
+                let bytes = cache
+                    .hedge
+                    .get_range(
+                        &self.storage.0.backend,
+                        &self.storage.path(&self.key),
+                        from + self.layout.offset..to + self.layout.offset,
+                    )
+                    .await?;
+                if bytes.len() as u64 != to - from {
+                    return Err(Error::Config("short object-store range response"));
+                }
+                // A piece that the cache keeps must not pin the rest of its read, so it is
+                // copied out; a piece that is the whole read, or that no cache keeps, shares it.
+                let keep_apart = self.admit && group.len() > 1;
+                let mut spill = Vec::new();
+                let mut out = Vec::with_capacity(group.len());
+                for i in group {
+                    let begin = (spans[i].start - from) as usize;
+                    let end = (spans[i].end - from) as usize;
+                    let value = if keep_apart {
+                        Bytes::copy_from_slice(&bytes[begin..end])
+                    } else {
+                        bytes.slice(begin..end)
+                    };
+                    let key = self.exact_key(&spans[i]);
+                    if spilling {
+                        spill.push((cache.disk_key(&key), value.clone()));
+                    }
+                    if self.admit {
+                        cache.insert_memory(key, value.clone());
+                    }
+                    out.push((i, value));
+                }
+                cache.spill_to_disk(spill);
+                Ok::<_, Error>(out)
+            }
+        }))
+        .await?;
+        for (i, value) in fetched.into_iter().flatten() {
+            pieces[i] = Some(value);
+        }
+        cache.memory.run_pending_tasks();
+        Ok(ranges
+            .iter()
+            .map(|range| {
+                if range.is_empty() {
+                    Bytes::new()
+                } else {
+                    pieces[distinct[&(range.start, range.end)]]
+                        .clone()
+                        .expect("every distinct range was read")
+                }
+            })
+            .collect())
     }
     /// Read a coalesced batch, signaling once its misses are reserved. Readers started after
     /// the signal share those requests and may finish before the whole batch does. Input
@@ -697,17 +898,8 @@ impl RangeReader {
                         return Err(Arc::new(Error::Config("short object-store range response")));
                     }
                     let mut values = Vec::with_capacity(indices.len());
-                    // At most MAX_SPILLS disk writes wait at once: on a cold cache the disk is slower
-                    // than the network, and an unbounded backlog would hold every fetched block in
-                    // memory. A skipped write only means that block is fetched again later.
-                    const MAX_SPILLS: usize = 16;
-                    let spilling = admit
-                        && cache.disk.is_some()
-                        && cache
-                            .spills
-                            .pending
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                            < MAX_SPILLS;
+                    // At most MAX_SPILLS disk writes wait at once (see `spill_has_room`).
+                    let spilling = admit && cache.spill_has_room();
                     let mut spill = Vec::new();
                     let keep_apart = admit && indices.len() > 1;
                     for index in indices {
@@ -730,28 +922,7 @@ impl RangeReader {
                         }
                         values.push(value);
                     }
-                    // The disk tier is written behind the read: a block-by-block write that the
-                    // read awaited cost about a millisecond per 4 KB block, which made a cold 2 MB
-                    // read take half a second after the network transfer had finished.
-                    if let Some(disk) = cache.disk.clone().filter(|_| spilling) {
-                        let spills = cache.spills.clone();
-                        spills
-                            .pending
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        tokio::task::spawn_blocking(move || {
-                            {
-                                let mut disk = disk.lock().unwrap();
-                                for (name, value) in spill {
-                                    // A full or damaged cache never makes source-of-truth reads fail.
-                                    let _ = disk.insert(&name, &value);
-                                }
-                            }
-                            spills
-                                .pending
-                                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                            spills.idle.notify_waiters();
-                        });
-                    }
+                    cache.spill_to_disk(spill);
                     // Apply pending evictions once per coalesced fetch, so memory stays within
                     // budget without paying for maintenance on every block.
                     cache.memory.run_pending_tasks();
@@ -832,6 +1003,15 @@ impl RangeReader {
             offset: self.layout.offset,
             len: self.layout.len,
             small: self.small,
+            span: 0,
+        }
+    }
+    fn exact_key(&self, range: &Range<u64>) -> BlockKey {
+        BlockKey {
+            index: range.start,
+            span: range.end - range.start,
+            small: 0,
+            ..self.block_key(0)
         }
     }
 }

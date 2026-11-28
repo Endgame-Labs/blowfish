@@ -34,6 +34,19 @@ pub trait RangeRead: Send + Sync {
     fn caches_blocks(&self) -> bool {
         false
     }
+    /// Fetch ranges in input order for a scan that will not read their neighbors: a caching
+    /// reader fetches and caches exactly these ranges (merging ranges at most `gap` bytes
+    /// apart into reads of at most `max` bytes) instead of whole blocks. Others read them as
+    /// [`RangeRead::read_batch`] does.
+    fn read_batch_exact(
+        &self,
+        ranges: Vec<Range<u64>>,
+        gap: u64,
+        max: u64,
+    ) -> impl Future<Output = io::Result<Vec<Bytes>>> + Send {
+        let _ = (gap, max);
+        self.read_batch(ranges)
+    }
     /// Fetch ranges that are small and scattered in the object (a rerank's vectors), in
     /// input order. A caching reader can fetch them in smaller blocks than it uses for scans.
     fn read_batch_sparse(
@@ -84,6 +97,14 @@ impl<R: RangeRead + ?Sized> RangeRead for std::sync::Arc<R> {
     }
     fn caches_blocks(&self) -> bool {
         (**self).caches_blocks()
+    }
+    fn read_batch_exact(
+        &self,
+        ranges: Vec<Range<u64>>,
+        gap: u64,
+        max: u64,
+    ) -> impl Future<Output = io::Result<Vec<Bytes>>> + Send {
+        (**self).read_batch_exact(ranges, gap, max)
     }
 }
 fn checked_range(range: Range<u64>, len: usize) -> io::Result<Range<usize>> {

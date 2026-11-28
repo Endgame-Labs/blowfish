@@ -115,6 +115,25 @@ impl ObjectReader {
             .await
             .map_err(io::Error::other)
     }
+    /// Read exactly these ranges (merging those at most `gap` bytes apart into reads of at most
+    /// `max` bytes) and cache each one whole, not in blocks: a cold leaf scan then fetches
+    /// the bytes it uses, not the blocks around them.
+    pub async fn read_batch_exact(
+        &self,
+        ranges: Vec<Range<u64>>,
+        gap: u64,
+        max: u64,
+    ) -> io::Result<Vec<Bytes>> {
+        if !self.bypass
+            && let Some(bytes) = crate::local_ann::read(&self.file.key, &ranges)
+        {
+            return Ok(bytes);
+        }
+        self.range_reader()?
+            .read_exact_batch_with_stats(&ranges, gap, max, &read_cache::stats())
+            .await
+            .map_err(io::Error::other)
+    }
     /// Read small ranges scattered over the object (rerank vectors) through small cache
     /// blocks, so a miss fetches `BF_SPARSE_BLOCK_BYTES` (default 16 KiB) instead of a full
     /// block, and the cache holds those vectors without the megabyte around each one.
@@ -2105,6 +2124,14 @@ impl bf_vector::RangeRead for ObjectReader {
     }
     async fn read_batch_sparse(&self, ranges: Vec<Range<u64>>) -> io::Result<Vec<Bytes>> {
         ObjectReader::read_batch_sparse(self, ranges).await
+    }
+    async fn read_batch_exact(
+        &self,
+        ranges: Vec<Range<u64>>,
+        gap: u64,
+        max: u64,
+    ) -> io::Result<Vec<Bytes>> {
+        ObjectReader::read_batch_exact(self, ranges, gap, max).await
     }
     fn len(&self) -> u64 {
         self.file.size
