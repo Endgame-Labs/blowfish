@@ -835,3 +835,35 @@ async fn exact_ranges_use_blocks_that_are_already_in_memory() {
     assert_eq!(got[0], data.slice(10..200));
     assert!(ranges(&backend).is_empty());
 }
+
+#[tokio::test]
+async fn concurrent_exact_reads_of_one_range_share_one_request() {
+    let (store, backend, data) = setup(CacheConfig {
+        memory_bytes: 1 << 20,
+        ..config()
+    })
+    .await;
+    let reader = store.range_reader("object").await.unwrap();
+    backend.ranges.lock().unwrap().clear();
+    backend.delay.store(true, Ordering::SeqCst);
+    let (ready, reserved) = tokio::sync::oneshot::channel();
+    let wanted = [300..420, 500..520];
+    let first =
+        reader.read_exact_batch_notifying(&wanted, 0, 1 << 20, &CacheStats::default(), ready);
+    let second = async {
+        // Starts after the first reserved its misses: it must attach to them, not refetch.
+        reserved.await.unwrap();
+        reader
+            .read_exact_batch_with_stats(&[500..520, 300..420], 0, 1 << 20, &CacheStats::default())
+            .await
+    };
+    let (a, b) = tokio::join!(first, second);
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(a[0], data.slice(300..420));
+    assert_eq!(b[0], data.slice(500..520));
+    assert_eq!(b[1], data.slice(300..420));
+    let mut fetched = ranges(&backend);
+    fetched.sort_by_key(|r| r.start);
+    assert_eq!(fetched, vec![300..420, 500..520]);
+    assert!(reader.is_memory_resident(300..420));
+}

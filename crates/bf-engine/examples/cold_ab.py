@@ -63,6 +63,12 @@ P.add_argument("--id-mode", choices=["random", "clustered"], default="random")
 P.add_argument("--id-max", type=int, default=10_000_000)
 P.add_argument("--id-span", type=int, default=0, help="clustered: width of the ID range (default 8 per ID, at least 4096)")
 P.add_argument("--id-seed", type=int, default=32)
+P.add_argument(
+    "--warm-repeats",
+    type=int,
+    default=0,
+    help="after each cold query, repeat it this many times with no cache drop; rows are recorded as arm NAME~warm (Round C40)",
+)
 P.add_argument("--top-k", type=int, default=10, help="top_k of every measured query (Round C33)")
 P.add_argument("--truth-key", help="oracle array containing exact IDs for this filter")
 P.add_argument("--scratch", type=Path, required=True)
@@ -546,13 +552,16 @@ try:
                         evict_staging(w)
                     (w / "server.log").write_text("")
                     query(name, item, c, w, p)
+                    for _ in range(a.warm_repeats):
+                        (w / "server.log").write_text("")
+                        query(name + "~warm", item, c, w, p)
                 else:
                     with server(name, list(arms).index(name)) as (c, w, p):
                         query(name, item, c, w, p)
     summary = {}
     for name, projection in [
         (name, projection)
-        for name in arms
+        for name in [*arms, *([n + "~warm" for n in arms] if a.warm_repeats else [])]
         for projection in (("ids", "attrs") if a.paired_projections else (None,))
     ]:
         part = [

@@ -474,12 +474,24 @@ impl RangeReader {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    /// Whether every block of a valid logical range is already in the memory tier.
+    /// Whether a valid logical range is already in the memory tier: cached whole by an exact
+    /// read, or covered by cached blocks.
     /// This advisory check performs no I/O, and concurrent eviction may change the answer.
     pub fn is_memory_resident(&self, range: Range<u64>) -> bool {
         if range.start > range.end || range.end > self.len() {
             return false;
         }
+        range.is_empty()
+            || self
+                .storage
+                .0
+                .cache
+                .memory
+                .contains_key(&self.exact_key(&range))
+            || self.is_blocks_resident(range)
+    }
+    /// Whether every block of a valid, nonempty-or-empty logical range is in the memory tier.
+    fn is_blocks_resident(&self, range: Range<u64>) -> bool {
         if range.is_empty() {
             return true;
         }
@@ -571,15 +583,14 @@ impl RangeReader {
     }
     /// Read ranges that are cached and fetched exactly as asked, not in whole blocks.
     ///
-    /// For a scan whose ranges are known and dense in neither direction (a cold leaf scan:
-    /// thousands of 70 KB ranges scattered over a multi-gigabyte object), whole-block fetches
-    /// read about a third more bytes than the ranges hold. Each missing range is fetched alone,
-    /// or merged with its neighbors when the gap between them is at most `gap` bytes and the
-    /// merged read stays within `max` bytes (the gap bytes are dropped). Every range is then
-    /// cached under its own exact span, in memory and on disk like a block, so a repeat of the
-    /// same read is a hit however the ranges merged. A range whose blocks are all in memory
-    /// (read earlier by block readers) is served from them. Concurrent identical misses are not
-    /// shared the way block misses are: each fetches its own copy.
+    /// For a scan whose ranges are known and scattered (a cold leaf scan: thousands of 70 KB
+    /// ranges over a multi-gigabyte object), whole-block fetches read about a third more bytes
+    /// than the ranges hold. Each missing range is fetched alone, or merged with its neighbors
+    /// when the gap between them is at most `gap` bytes and the merged read stays within `max`
+    /// bytes (the gap bytes are dropped). Every range is cached under its own exact span, in
+    /// memory and on disk like a block, so a repeat of the same read is a hit however the ranges
+    /// merged, and concurrent reads of one range share one request. A range whose blocks are
+    /// all in memory (read earlier by block readers) is served from them.
     pub async fn read_exact_batch_with_stats(
         &self,
         ranges: &[Range<u64>],
@@ -587,9 +598,34 @@ impl RangeReader {
         max: u64,
         stats: &CacheStats,
     ) -> Result<Vec<Bytes>, Error> {
+        self.read_exact_batch_inner(ranges, gap, max, stats, None)
+            .await
+    }
+    /// [`RangeReader::read_exact_batch_with_stats`], signaling once its misses are reserved, so
+    /// that readers started after the signal share those requests (see
+    /// [`RangeReader::read_batch_notifying`]). Keep this future alive until the reads finish.
+    pub async fn read_exact_batch_notifying(
+        &self,
+        ranges: &[Range<u64>],
+        gap: u64,
+        max: u64,
+        stats: &CacheStats,
+        ready: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<Vec<Bytes>, Error> {
+        self.read_exact_batch_inner(ranges, gap, max, stats, Some(ready))
+            .await
+    }
+    async fn read_exact_batch_inner(
+        &self,
+        ranges: &[Range<u64>],
+        gap: u64,
+        max: u64,
+        stats: &CacheStats,
+        mut ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<Vec<Bytes>, Error> {
         let cache = &self.storage.0.cache;
         if cache.mapped.get().is_some() {
-            return self.read_batch_with_stats(ranges, stats).await;
+            return self.read_batch_inner(ranges, stats, ready).await;
         }
         let mut distinct = BTreeMap::<(u64, u64), usize>::new();
         for range in ranges {
@@ -611,7 +647,7 @@ impl RangeReader {
         let looked_up = cache.lookup_many(&wanted, self.admit).await;
         let mut pieces: Vec<Option<Bytes>> = vec![None; spans.len()];
         let (mut memory, mut disk, mut memory_pieces, mut disk_pieces) = (0, 0, 0, 0);
-        let mut missing = Vec::new();
+        let mut unresolved = Vec::new();
         for (i, found) in looked_up.into_iter().enumerate() {
             let weight = spans[i].end - spans[i].start;
             match found {
@@ -625,15 +661,79 @@ impl RangeReader {
                     disk_pieces += 1;
                     pieces[i] = Some(bytes);
                 }
-                None => missing.push(i),
+                None => unresolved.push(i),
             }
         }
         stats.record_many(Tier::Memory, memory, memory_pieces);
         stats.record_many(Tier::Disk, disk, disk_pieces);
         // Ranges that block readers already hold in memory cost nothing to serve from there.
-        let (resident, missing): (Vec<usize>, Vec<usize>) = missing
+        let (resident, unresolved): (Vec<usize>, Vec<usize>) = unresolved
             .into_iter()
-            .partition(|&i| self.is_memory_resident(spans[i].clone()));
+            .partition(|&i| self.is_blocks_resident(spans[i].clone()));
+        let mut pending = Vec::<(usize, Arc<Flight>)>::new();
+        if !unresolved.is_empty() {
+            // Serialize only the reservation of missing ranges, as block reads do: the re-check
+            // under the lock closes races with fetches that finished since the lookup.
+            let mut planning = cache.planning.lock().await;
+            planning.flights.retain(|_, weak| weak.strong_count() > 0);
+            let mut missing = Vec::new();
+            for i in unresolved {
+                let key = self.exact_key(&spans[i]);
+                let weight = spans[i].end - spans[i].start;
+                if let Some(bytes) = cache.memory.get(&key) {
+                    stats.record(Tier::Memory, weight);
+                    pieces[i] = Some(bytes);
+                    continue;
+                }
+                stats.record(Tier::Miss, weight);
+                if let Some(flight) = planning.flights.get(&key).and_then(Weak::upgrade) {
+                    pending.push((i, flight));
+                } else {
+                    missing.push(i);
+                }
+            }
+            // `missing` is in start order (the map's key order). Merge, then fetch each group.
+            let mut groups: Vec<Vec<usize>> = Vec::new();
+            for i in missing {
+                match groups.last_mut() {
+                    Some(group)
+                        if {
+                            let first = spans[group[0]].start;
+                            let end = group.iter().map(|&j| spans[j].end).max().unwrap_or(0);
+                            spans[i].start <= end.saturating_add(gap)
+                                && spans[i].end.max(end) - first <= max
+                        } =>
+                    {
+                        group.push(i);
+                    }
+                    _ => groups.push(vec![i]),
+                }
+            }
+            for group in groups {
+                let reader = self.clone();
+                let group_spans: Vec<Range<u64>> =
+                    group.iter().map(|&i| spans[i].clone()).collect();
+                let fetch = async move { reader.fetch_exact_group(group_spans).await }
+                    .boxed()
+                    .shared();
+                for (position, &i) in group.iter().enumerate() {
+                    let fetch = fetch.clone();
+                    let flight = Arc::new(Flight(
+                        async move { Ok(fetch.await?[position].clone()) }
+                            .boxed()
+                            .shared(),
+                    ));
+                    planning
+                        .flights
+                        .insert(self.exact_key(&spans[i]), Arc::downgrade(&flight));
+                    pending.push((i, flight));
+                }
+            }
+            drop(planning);
+        }
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(());
+        }
         if !resident.is_empty() {
             let from_blocks: Vec<_> = resident.iter().map(|&i| spans[i].clone()).collect();
             let bytes = self.read_batch_with_stats(&from_blocks, stats).await?;
@@ -641,77 +741,15 @@ impl RangeReader {
                 pieces[i] = Some(bytes);
             }
         }
-        // `missing` is in start order (the map's key order). Merge, then fetch every group.
-        let mut groups: Vec<Vec<usize>> = Vec::new();
-        for i in missing {
-            stats.record(Tier::Miss, spans[i].end - spans[i].start);
-            match groups.last_mut() {
-                Some(group)
-                    if {
-                        let first = &spans[group[0]];
-                        let end = group.iter().map(|&j| spans[j].end).max().unwrap_or(0);
-                        spans[i].start <= end.saturating_add(gap)
-                            && spans[i].end.max(end) - first.start <= max
-                    } =>
-                {
-                    group.push(i);
-                }
-                _ => groups.push(vec![i]),
-            }
+        let fetched: Vec<(usize, Bytes)> =
+            futures::future::try_join_all(pending.into_iter().map(|(i, flight)| async move {
+                let bytes = flight.0.clone().await.map_err(Error::from_shared)?;
+                Ok::<_, Error>((i, bytes))
+            }))
+            .await?;
+        for (i, bytes) in fetched {
+            pieces[i] = Some(bytes);
         }
-        let spilling = self.admit && cache.spill_has_room();
-        let fetched = futures::future::try_join_all(groups.into_iter().map(|group| {
-            let spans = &spans;
-            async move {
-                let from = spans[group[0]].start;
-                let to = group.iter().map(|&i| spans[i].end).max().unwrap_or(from);
-                let _permit = cache
-                    .fetches
-                    .acquire()
-                    .await
-                    .expect("cache semaphore stays open");
-                let bytes = cache
-                    .hedge
-                    .get_range(
-                        &self.storage.0.backend,
-                        &self.storage.path(&self.key),
-                        from + self.layout.offset..to + self.layout.offset,
-                    )
-                    .await?;
-                if bytes.len() as u64 != to - from {
-                    return Err(Error::Config("short object-store range response"));
-                }
-                // A piece that the cache keeps must not pin the rest of its read, so it is
-                // copied out; a piece that is the whole read, or that no cache keeps, shares it.
-                let keep_apart = self.admit && group.len() > 1;
-                let mut spill = Vec::new();
-                let mut out = Vec::with_capacity(group.len());
-                for i in group {
-                    let begin = (spans[i].start - from) as usize;
-                    let end = (spans[i].end - from) as usize;
-                    let value = if keep_apart {
-                        Bytes::copy_from_slice(&bytes[begin..end])
-                    } else {
-                        bytes.slice(begin..end)
-                    };
-                    let key = self.exact_key(&spans[i]);
-                    if spilling {
-                        spill.push((cache.disk_key(&key), value.clone()));
-                    }
-                    if self.admit {
-                        cache.insert_memory(key, value.clone());
-                    }
-                    out.push((i, value));
-                }
-                cache.spill_to_disk(spill);
-                Ok::<_, Error>(out)
-            }
-        }))
-        .await?;
-        for (i, value) in fetched.into_iter().flatten() {
-            pieces[i] = Some(value);
-        }
-        cache.memory.run_pending_tasks();
         Ok(ranges
             .iter()
             .map(|range| {
@@ -724,6 +762,58 @@ impl RangeReader {
                 }
             })
             .collect())
+    }
+    /// One merged read covering `spans` (sorted by start), cut into the pieces it was asked
+    /// for, which are cached and spilled like blocks.
+    async fn fetch_exact_group(
+        &self,
+        spans: Vec<Range<u64>>,
+    ) -> Result<Arc<Vec<Bytes>>, Arc<Error>> {
+        let cache = &self.storage.0.cache;
+        let from = spans[0].start;
+        let to = spans.iter().map(|r| r.end).max().unwrap_or(from);
+        let _permit = cache
+            .fetches
+            .acquire()
+            .await
+            .expect("cache semaphore stays open");
+        let bytes = cache
+            .hedge
+            .get_range(
+                &self.storage.0.backend,
+                &self.storage.path(&self.key),
+                from + self.layout.offset..to + self.layout.offset,
+            )
+            .await
+            .map_err(|e| Arc::new(Error::from(e)))?;
+        if bytes.len() as u64 != to - from {
+            return Err(Arc::new(Error::Config("short object-store range response")));
+        }
+        // A piece that the cache keeps must not pin the rest of its read, so it is copied out;
+        // a piece that is the whole read, or that no cache keeps, shares the response buffer.
+        let keep_apart = self.admit && spans.len() > 1;
+        let spilling = self.admit && cache.spill_has_room();
+        let mut spill = Vec::new();
+        let mut out = Vec::with_capacity(spans.len());
+        for span in &spans {
+            let (begin, end) = ((span.start - from) as usize, (span.end - from) as usize);
+            let value = if keep_apart {
+                Bytes::copy_from_slice(&bytes[begin..end])
+            } else {
+                bytes.slice(begin..end)
+            };
+            let key = self.exact_key(span);
+            if spilling {
+                spill.push((cache.disk_key(&key), value.clone()));
+            }
+            if self.admit {
+                cache.insert_memory(key, value.clone());
+            }
+            out.push(value);
+        }
+        cache.spill_to_disk(spill);
+        cache.memory.run_pending_tasks();
+        Ok(Arc::new(out))
     }
     /// Read a coalesced batch, signaling once its misses are reserved. Readers started after
     /// the signal share those requests and may finish before the whole batch does. Input

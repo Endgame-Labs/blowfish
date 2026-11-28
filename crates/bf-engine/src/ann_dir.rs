@@ -82,24 +82,6 @@ fn vector_pieces(
     out
 }
 
-/// Seeding needs cached blocks, not assembled cluster buffers. Splitting on small aligned
-/// boundaries lets the range cache return borrowed block slices instead of copying every
-/// large code range into a buffer that the seed task immediately discards. The cache still
-/// coalesces the same missing blocks into the same backend reads.
-fn seed_pieces(ranges: Vec<std::ops::Range<u64>>) -> Vec<std::ops::Range<u64>> {
-    const PIECE: u64 = 64 << 10;
-    let mut out = Vec::new();
-    for range in ranges {
-        let mut start = range.start;
-        while start < range.end {
-            let end = start.saturating_add(PIECE - start % PIECE).min(range.end);
-            out.push(start..end);
-            start = end;
-        }
-    }
-    out
-}
-
 type Reader = segment::ObjectReader;
 /// Exact hits `(distance, row)` and estimated candidates from one segment.
 type Found = (Vec<(f32, u32)>, Vec<Candidate>);
@@ -412,7 +394,15 @@ fn speculate_leaf_reads(
             let stats = stats.clone();
             tokio::spawn(async move {
                 let (ready, _) = tokio::sync::oneshot::channel();
-                let _ = reader.read_batch_notifying(&ranges, &stats, ready).await;
+                let _ = reader
+                    .read_exact_batch_notifying(
+                        &ranges,
+                        bf_vector::read_gap(BLOCK_GAP),
+                        BLOB_MERGE_MAX,
+                        &stats,
+                        ready,
+                    )
+                    .await;
             });
         }
     }
@@ -1612,11 +1602,6 @@ pub(crate) async fn search(
                     continue;
                 }
                 locally_staged = false;
-                let ranges = if filtered {
-                    seed_pieces(ranges)
-                } else {
-                    ranges
-                };
                 let reader = store
                     .range_reader_with_length(&file.key, file.size, true)
                     .map_err(segment::index_error)?;
@@ -1624,7 +1609,15 @@ pub(crate) async fn search(
                 let (ready, reserved) = tokio::sync::oneshot::channel();
                 reservations.push(reserved);
                 bulk.spawn(async move {
-                    let _ = reader.read_batch_notifying(&ranges, &stats, ready).await;
+                    let _ = reader
+                        .read_exact_batch_notifying(
+                            &ranges,
+                            bf_vector::read_gap(BLOCK_GAP),
+                            BLOB_MERGE_MAX,
+                            &stats,
+                            ready,
+                        )
+                        .await;
                 });
             }
         }
