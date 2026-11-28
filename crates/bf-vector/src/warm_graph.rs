@@ -21,6 +21,9 @@ fn scan_chunk(allowed: usize, threads: usize) -> usize {
     allowed.div_ceil(threads.max(1) * 2).max(8192)
 }
 
+/// The beam width from which a walk keeps its beam in chunks ([`navigation::Scratch::search_wide`]).
+const WIDE_BEAM: usize = 512;
+
 fn check(cancelled: &(impl Fn() -> bool + Sync)) -> Result<()> {
     if cancelled() {
         Err(Error::Io(std::io::Error::new(
@@ -290,15 +293,30 @@ impl HotGraph {
             .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
             .unwrap()
             .0;
-        let (mut hits, evaluations) = scratch.0.search_prefetched(
-            &self.links,
-            &self.degrees,
-            entry,
-            ef.max(count).min(self.len()),
-            |id| self.codes.score(&code, scale, id),
-            |id| self.codes.prefetch(id),
-            Some(screen),
-        );
+        let ef = ef.max(count).min(self.len());
+        // A wide beam (a broad filter's widened walk) keeps its beam in chunks: the same search
+        // and the same answer, without moving the whole beam for each accepted node.
+        let (mut hits, evaluations) = if ef >= WIDE_BEAM {
+            scratch.0.search_wide(
+                &self.links,
+                &self.degrees,
+                entry,
+                ef,
+                |id| self.codes.score(&code, scale, id),
+                |id| self.codes.prefetch(id),
+                Some(screen),
+            )
+        } else {
+            scratch.0.search_prefetched(
+                &self.links,
+                &self.degrees,
+                entry,
+                ef,
+                |id| self.codes.score(&code, scale, id),
+                |id| self.codes.prefetch(id),
+                Some(screen),
+            )
+        };
         hits.retain(|h| live.is_none_or(|m| m.contains(self.rows[h.id as usize])));
         hits.truncate(count);
         Ok((
@@ -477,6 +495,79 @@ mod tests {
                 .is_err()
         );
         assert!(graph.scan(query, 0, usize::MAX, &all, true).is_err());
+    }
+    #[test]
+    fn wide_search_is_the_sorted_beam_search_with_and_without_a_screen() {
+        let (dims, n) = (32, 3000);
+        let mut seed = 21u64;
+        let source = (0..n)
+            .map(|_| {
+                (0..dims)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        (seed >> 40) as f32 / 16777216. * 2. - 1.
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut b = HotGraphBuilder::new(dims, n).unwrap();
+        let ids = (0..n as u32).map(|i| i + 10).collect::<Vec<_>>();
+        let packed = source
+            .iter()
+            .flatten()
+            .flat_map(|x| f16::from_f32(*x).to_le_bytes())
+            .collect::<Vec<_>>();
+        b.append(&ids, &packed, &|| false).unwrap();
+        let graph = b.finish(&|| false).unwrap();
+        let mut beam = graph.scratch();
+        let mut wide = graph.scratch();
+        let mut compared = 0;
+        for q in [0, 5, 77, 300, 2999] {
+            let normalized = vectors::normalized(&source[q]);
+            let rotated = rabitq::RaBitQ::new(dims, 42).unwrap().rotate(&normalized);
+            let (code, scale) = quant::encode(&rotated);
+            let signs = graph.bits.query(&rotated);
+            let entry = graph.entries[0];
+            for ef in [1, 2, 10, 64, 300, 700, 2000, 3000] {
+                for screened in [false, true] {
+                    let screen = || {
+                        screened.then(|| navigation::Screen::with_margin(&graph.bits, &signs, 2))
+                    };
+                    let (a, evals_a) = beam.0.search_prefetched(
+                        &graph.links,
+                        &graph.degrees,
+                        entry,
+                        ef,
+                        |id| graph.codes.score(&code, scale, id),
+                        |_| {},
+                        screen(),
+                    );
+                    let (w, evals_w) = wide.0.search_wide(
+                        &graph.links,
+                        &graph.degrees,
+                        entry,
+                        ef,
+                        |id| graph.codes.score(&code, scale, id),
+                        |_| {},
+                        screen(),
+                    );
+                    assert_eq!(
+                        a.iter()
+                            .map(|h| (h.id, h.distance.to_bits()))
+                            .collect::<Vec<_>>(),
+                        w.iter()
+                            .map(|h| (h.id, h.distance.to_bits()))
+                            .collect::<Vec<_>>(),
+                        "query {q} ef {ef} screened {screened}"
+                    );
+                    assert_eq!(evals_a, evals_w, "query {q} ef {ef} screened {screened}");
+                    compared += 1;
+                }
+            }
+        }
+        assert_eq!(compared, 80);
     }
     #[test]
     fn one_bit_screen_keeps_the_nearest_rows_and_the_exact_shortlist_size() {
