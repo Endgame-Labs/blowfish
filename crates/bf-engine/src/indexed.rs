@@ -1056,8 +1056,46 @@ async fn prepare_segment(
     } else {
         RoaringBitmap::new()
     };
+    // `Sum(BM25, boost of one attribute)` opens only the text windows that can reach the `k`th total.
+    let mut boosted = false;
+    if streaming
+        && !clause_top
+        && grouped.is_none()
+        && q.limit.as_ref().and_then(Limit::per).is_none()
+        && let Some(rank) = q.rank_by.as_ref()
+        && let Some(boost) = crate::boosted::Boost::of(rank)
+        && let RankBy::Bm25 {
+            attribute,
+            query,
+            params,
+        } = boost.clause
+        && let Some(reader) = indexes.get(attribute)
+    {
+        let cfg = state.schema[attribute]
+            .text_config()
+            .expect("validated FTS");
+        let query = bf_text::Query::new(
+            crate::text::tokens(query, &cfg),
+            crate::text::prefix(params.as_ref()),
+        );
+        let fallback = bf_text::CorpusStats::default();
+        let stats = state.corpus.get(attribute).unwrap_or(&fallback);
+        if let Some(found) = crate::boosted::select(
+            store, state, seg, reader, &boost, &query, stats, &cfg, &allowed, k,
+        )
+        .await?
+        {
+            boosted = true;
+            selected = found.rows;
+            bm25_hits.push((rank_key(boost.clause), found.hits));
+        }
+    }
     // A `Sum` that already chose its winners hydrates just those rows.
-    let searched: &[&RankBy] = if preset.is_some() { &[] } else { clauses };
+    let searched: &[&RankBy] = if preset.is_some() || boosted {
+        &[]
+    } else {
+        clauses
+    };
     let chosen = preset.is_some();
     if let Some((hits, rows)) = preset {
         // The winners include rows that match no text (a bonus alone puts them in).
@@ -1169,7 +1207,7 @@ async fn prepare_segment(
         }
         bm25_hits.push((rank_key(clause), hits));
     }
-    if streaming {
+    if streaming && !boosted {
         selected =
             crate::ordinal_scan::select(store, state, q, seg, clauses, &bm25_hits, &allowed, k)
                 .await?;

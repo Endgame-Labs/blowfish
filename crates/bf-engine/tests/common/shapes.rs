@@ -57,7 +57,7 @@ pub fn row(id: u64, text: fn(u64) -> String) -> Value {
     let pop = ((id * 37) % 101) as f64 * 0.99;
     let day = 1 + (id * 7) % 28;
     let month = 1 + (id / 3) % 12;
-    json!({"id": id, "text": text(id), "n": id % 5, "pop": pop,
+    json!({"id": id, "text": text(id), "n": id % 5, "pop": pop, "m": (id * 37) % 101, "q": pop,
         "ts": format!("2026-{month:02}-{day:02}T00:00:00Z")})
 }
 /// IDs descend within each batch, so row order opposes ID order for tied scores.
@@ -198,11 +198,15 @@ pub const TIES: &[(&str, &str)] = &[("red fox", "blue bird"), ("wolf", "green ca
 pub const VARIED: &[(&str, &str)] = &[("w3 w9", "w1 w40"), ("w0", "w2 w5 w300"), ("w600", "w4")];
 
 pub async fn corpus(e: &Engine, f: fn(u64) -> String) {
+    corpus_with(e, f, true).await
+}
+async fn corpus_with(e: &Engine, f: fn(u64) -> String, filterable: bool) {
     write(
         e,
         json!({"schema":{"text":{"type":"string","full_text_search":true},
-            "pop":{"type":"float","filterable":true},"ts":{"type":"datetime"},
-            "n":{"type":"uint","filterable":true}},
+            "pop":{"type":"float","filterable":filterable},"ts":{"type":"datetime"},
+            "n":{"type":"uint","filterable":filterable},
+            "m":{"type":"uint","filterable":false},"q":{"type":"float","filterable":false}},
             "upsert_rows": batch_with(0..500, f)}),
     )
     .await;

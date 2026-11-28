@@ -25,6 +25,8 @@ const VERSION_COMPRESSED: u32 = 6;
 const VERSION_COMPACT: u32 = 7;
 
 const BLOCK: usize = 128;
+/// Rows per scoring window (the unit of [`SegmentReader::window_bounds`]).
+pub const WINDOW: usize = BLOCK;
 /// Whether to score a mask's rows directly instead of walking windows. The window walk pays per
 /// window it touches and the direct path per allowed row, so the direct path wins when the mask is
 /// sparse and scattered: at most a quarter of the segment's rows, and (sampling eight spots of
@@ -914,6 +916,8 @@ pub struct SearchMetrics {
     pub windows_pruned: usize,
     /// Rows scored after allowed-row filtering.
     pub rows_scored: usize,
+    /// Only for [`SegmentReader::window_bounds`]: every window's score bound.
+    pub window_bounds: Vec<f64>,
 }
 
 /// A monotone score floor for one top-k query over disjoint live segments.
@@ -969,6 +973,8 @@ enum SearchMode<'a> {
     Demand,
     Prefetched,
     Shared(&'a SearchThreshold),
+    /// Stop once every window's bound is known, and return the bounds.
+    Windows,
 }
 
 fn search_floor(
@@ -2406,6 +2412,21 @@ impl SegmentReader {
         self.search_internal(query, stats, params, k, allowed, SearchMode::Prefetched)
             .await
     }
+    /// An upper bound on the BM25 score of any row in each scoring window (rows
+    /// `w * WINDOW..(w + 1) * WINDOW`), for every window of the segment, without
+    /// reading or scoring rows beyond what the bounds need. The bounds are the ones
+    /// a search prunes by, so a row's exact score never exceeds its window's bound.
+    /// An empty vector means every window scores 0 (no query term occurs here).
+    pub async fn window_bounds(
+        &self,
+        query: &Query,
+        stats: &CorpusStats,
+        params: &FtsParams,
+    ) -> io::Result<Vec<f64>> {
+        self.search_internal(query, stats, params, 1, None, SearchMode::Windows)
+            .await
+            .map(|(_, metrics)| metrics.window_bounds)
+    }
     /// Top-k BM25 with namespace-wide statistics, optional live/allowed rows, and
     /// conservative block-max pruning. An empty query or `k == 0` returns no hits.
     pub async fn search(
@@ -2560,7 +2581,8 @@ impl SegmentReader {
             self.read_search_blocks(&mut terms, wanted, &saturation, &mut metrics)
                 .await?;
         }
-        if terms.iter().all(|term| term.small) {
+        let bounds_only = matches!(mode, SearchMode::Windows);
+        if !bounds_only && terms.iter().all(|term| term.small) {
             // Every posting is already available. Accumulate once in reference
             // order instead of building window bounds and scoring those rows again.
             let mut scores = crate::scratch::Rows::take(self.docs as usize);
@@ -2604,6 +2626,7 @@ impl SegmentReader {
             return Ok((hits, metrics));
         }
         if let Some(rows) = allowed
+            && !bounds_only
             && query.prefix().is_none()
             && direct_mask(rows, self.docs)
         {
@@ -2730,6 +2753,14 @@ impl SegmentReader {
                 let w = row as usize / BLOCK;
                 bounds[w] += std::mem::take(&mut maxima[w]);
             }
+        }
+        if bounds_only {
+            metrics.window_bounds = bounds
+                .iter()
+                .enumerate()
+                .map(|(w, b)| (b + f64::from(prefix_windows[w])) * margin)
+                .collect();
+            return Ok((Vec::new(), metrics));
         }
         let mut order = Ranked::new(
             bounds
