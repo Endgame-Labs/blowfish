@@ -18935,7 +18935,7 @@ Built in `bf-types`: the vector's raw JSON text goes to a reader that follows `s
 
 Cleanup: the M4 run directory (fixture, store, binaries; about 27 GB) is deleted and nothing of mine is running there; the fixture was fetched through this VM (about $2.4 of S3 transfer); no EC2; no bucket writes; `.scratch/g24` removed.
 
-## Round BW29: `limit.per` groups by integer code (4.3 to 4.9 times), token-set filters stop building every row (1.1 to 3.3 times); a fused filter-in-BM25 search was built, matched, and killed; the token-budget bound prunes nothing
+## Round BW29: `limit.per` groups by integer code (4.3 to 5.0 times), token-set filters stop building every row (1.1 to 3.3 times); a fused filter-in-BM25 search was built, matched, and killed; the token-budget bound prunes nothing
 
 ### What shipped
 
