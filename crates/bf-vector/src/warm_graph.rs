@@ -21,6 +21,22 @@ fn scan_chunk(allowed: usize, threads: usize) -> usize {
     allowed.div_ceil(threads.max(1) * 2).max(8192)
 }
 
+/// TEMPORARY (Round G28, removed before the round ends): the measurement switch file.
+fn g28_oldbeam() -> bool {
+    static CELL: std::sync::Mutex<(Option<std::time::Instant>, bool)> =
+        std::sync::Mutex::new((None, false));
+    let mut cell = CELL.lock().unwrap_or_else(|e| e.into_inner());
+    if cell
+        .0
+        .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(300))
+    {
+        let text = std::env::var_os("BF_G28_SWITCH")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        *cell = (Some(std::time::Instant::now()), text.contains("oldbeam"));
+    }
+    cell.1
+}
 /// The beam width from which a walk keeps its beam in chunks ([`navigation::Scratch::search_wide`]).
 const WIDE_BEAM: usize = 512;
 
@@ -296,7 +312,7 @@ impl HotGraph {
         let ef = ef.max(count).min(self.len());
         // A wide beam (a broad filter's widened walk) keeps its beam in chunks: the same search
         // and the same answer, without moving the whole beam for each accepted node.
-        let (mut hits, evaluations) = if ef >= WIDE_BEAM {
+        let (mut hits, evaluations) = if ef >= WIDE_BEAM && !g28_oldbeam() {
             scratch.0.search_wide(
                 &self.links,
                 &self.degrees,

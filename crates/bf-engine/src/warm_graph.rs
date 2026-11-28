@@ -1220,6 +1220,22 @@ impl Drop for ScratchLoan<'_> {
         }
     }
 }
+/// TEMPORARY (Round G28, removed before the round ends): the measurement switch file.
+pub(crate) fn g28_switch_has(word: &str) -> bool {
+    static CELL: std::sync::LazyLock<Mutex<(Option<Instant>, Arc<str>)>> =
+        std::sync::LazyLock::new(|| Mutex::new((None, Arc::from(""))));
+    let mut cell = CELL.lock().unwrap_or_else(|e| e.into_inner());
+    if cell
+        .0
+        .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(300))
+    {
+        let text = std::env::var_os("BF_G28_SWITCH")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        *cell = (Some(Instant::now()), Arc::from(text.trim()));
+    }
+    cell.1.contains(word)
+}
 /// Rows kept by SQ8 distance for the exact rerank of a filtered scan, for `k` wanted rows.
 fn scan_shortlist(k: usize) -> usize {
     (k * 3).max(30)
@@ -1635,6 +1651,7 @@ async fn search_entry(
     };
     if columns.is_empty()
         && let Some(table) = entry.ids.get()
+        && !(matches!(table, IdTable::Str { .. }) && g28_switch_has("strold"))
         && let Some(found) = ids_from_table(table, &exact, mask.as_deref(), set, at, k)
     {
         return Ok(found);
@@ -1770,6 +1787,9 @@ pub(crate) async fn search_ids(
         return None;
     }
     let table = entry.ids.get()?;
+    if matches!(table, IdTable::Str { .. }) && g28_switch_has("strold") {
+        return None;
+    }
     let _permit = entry.slots.try_acquire().ok()?;
     let exact = ranked_rows(vector, navigate.map(|m| &**m), k, &entry, ef, false)
         .await
