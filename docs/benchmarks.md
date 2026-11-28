@@ -18790,3 +18790,121 @@ On the earlier promoted server (`ef` lower, 17,155 for switch 0, bit 8 not yet b
 `warm_graph::tests::filtered_scan_hides_shadowed_rows_inside_the_allowed_set` fail with "test graph was never admitted" (memory admission under the full parallel run); it passes alone and on the rerun.
 
 Cleanup: the M4 run directory (fixture, store, binaries; about 26 GB) is deleted and nothing of mine is running there; the corpus fixture was fetched through this VM (about $2.4 of S3 transfer); no EC2; no bucket writes; `.scratch/g23` removed.
+
+## Round BW29: `limit.per` groups by integer code (4.3 to 4.9 times), token-set filters stop building every row (1.1 to 3.3 times); a fused filter-in-BM25 search was built, matched, and killed; the token-budget bound prunes nothing
+
+### What shipped
+
+1. **`limit.per` by group code** (`segment::group_codes`, `ordinal_scan.rs`). When the group is one scalar attribute (string, int, uint, bool,
+   UUID, or datetime) with a filter dictionary, the dictionary is inverted once per segment into a row-to-group array of `u16` codes
+   (2 bytes a row, charged to the decoded cache like the dictionary). The ordinal scorer then projects no column for the group and
+   builds no JSON key: each scored row goes to the heap of its code. Rows with a null or missing value share one group, as the old
+   `[null]` key did. The path is skipped (the column path runs, unchanged) for arrays, non-filterable attributes, `id`, more than 65,535
+   values, a row listed under two values, and `limit.per` over two or more attributes.
+2. **Token-set filters start from the first token's rows** (`bf-text` `contains_all_tokens` and `contains_token_sequence`). Both began by
+   building a bitmap of every row in the segment, about 5 ns a row (4.9 ms for 8 segments of 125,000 rows on this VM, measured alone),
+   and intersected each token into it. They now start from the first token's rows, stop at the first empty intersection, and build each
+   term's rows from its sorted postings (`from_sorted_iter`, about 2 times faster than per-row inserts). Empty queries still match every
+   row (`ContainsAllTokens`) or none (`ContainsAnyToken`). No format changed.
+
+### Measurement
+
+Fixture: a fresh load of the first 1M MS MARCO passages (the v021 corpus) with a `cat` int column (`id % 8`, `filterable`), 8 text
+segments, on this VM's local disk, read-only, 4 Rayon workers (`bench/scale/bw29_load.py`). Driver: `bench/scale/bw29_ab.py` with
+`bw29_shapes.py`. **Every round starts each build in a fresh process** (order alternating AB, BA, AB), prewarms on one slice of 100
+queries, and times two more slices that no process has seen (a repeated token answers from a cache, as BW27 found), at 1 client and
+at 16. Medians of 3 rounds; the table shows p50 and p90 in ms and the server's CPU ms per query (from `/proc`, which stays steady while
+this VM carries a load of 10 to 17 from other workers, so use it rather than p50 when they disagree). A is the v0.1.78 baseline
+(`HEAD` before this round), B is this round. Ordered IDs and `$dist` scores of **every** answer are identical between A and B (all
+shapes, both client counts, and the cold pass).
+
+Shapes (`top_k` 10 unless noted, real MS MARCO queries from `bench/scale/data/bm25-msmarco.json`):
+
+- `all3+bm25`, `any3+bm25`: BW27's: three words no other query uses, as both the filter and the BM25 query (`all3` is empty for most).
+- `seq+bm25`: `ContainsTokenSequence` of the query's first two words, ranked by the whole query.
+- `all1q`, `all2q`, `any3q`: the first one, two, or three words (over three letters) of the query as the filter, ranked by the whole query.
+- `all2c`, `any2m`, `seqc`: filters on very common tokens (`the and`), mid-frequency ones (`water people`), and common phrases (`of the`).
+- `per1`, `per3`: BM25 with `limit: {total: 10, per: {attributes: ["cat"], limit: 1 or 3}}`.
+
+Warm, 1 client (A then B; p50 / p90 / CPU ms):
+
+| Shape | A | B | p50 gain | CPU gain |
+| --- | --- | --- | ---: | ---: |
+| `plain` (control) | 2.9 / 7.2 / 5.0 | 3.8 / 8.7 / 5.0 | 0.76 (noise) | 1.00 |
+| `all3+bm25` | 8.2 / 14.4 / 10.9 | 3.3 / 6.8 / 3.3 | **2.46** | **3.30** |
+| `any3+bm25` | 6.0 / 10.9 / 8.1 | 4.7 / 8.3 / 7.0 | 1.27 | 1.16 |
+| `seq+bm25` | 6.4 / 15.6 / 15.2 | 3.9 / 9.8 / 8.6 | 1.64 | 1.77 |
+| `all1q+bm25` | 6.7 / 13.5 / 9.1 | 4.4 / 9.0 / 4.9 | 1.52 | 1.86 |
+| `all2q+bm25` | 7.0 / 11.3 / 11.9 | 3.5 / 6.0 / 3.6 | **2.01** | **3.31** |
+| `any3q+bm25` | 7.7 / 15.8 / 10.1 | 5.5 / 10.1 / 8.1 | 1.38 | 1.25 |
+| `all2c+bm25` | 4.4 / 9.2 / 5.6 | 3.8 / 8.4 / 5.0 | 1.17 | 1.12 |
+| `any2m+bm25` | 4.6 / 7.9 / 5.9 | 4.5 / 7.2 / 5.5 | 1.01 | 1.07 |
+| `seqc+bm25` | 4.9 / 8.9 / 6.9 | 5.4 / 10.1 / 7.1 | 0.91 (noise) | 0.97 |
+| `per1` | 209.5 / 302.3 / 602 | 48.7 / 82.5 / 135 | **4.30** | **4.48** |
+| `per3` | 197.9 / 292.5 / 575 | 45.0 / 66.6 / 123 | **4.40** | **4.69** |
+
+Warm, 16 clients (p50 / p90 ms, CPU ms per query): `all3+bm25` 33.6 / 57.1 / 10.9 to 20.5 / 97.5 / 3.7 (1.64 times, CPU 2.95); `all2q+bm25`
+37.8 / 73.7 / 11.9 to 22.0 / 85.5 / 3.8 (1.72, CPU 3.13); `seq+bm25` 42.8 / 93.3 / 13.8 to 29.9 / 95.5 / 8.7 (1.43, CPU 1.59);
+`any3q` 1.12 (CPU 1.23); `all1q` 1.11 (CPU 1.37); `any3`, `all2c`, `any2m`, and `seqc` 0.93 to 1.01 (CPU 0.95 to 1.09); `plain` 0.87
+(CPU 1.06, noise). `per1` 2,393 / 2,824 to 624 / 789 (3.84 times, CPU 4.87), `per3` 2,461 / 2,792 to 582 / 693 (4.23, CPU 4.83).
+
+Cold (a fresh process per shape, the first 100 queries at one client, so each pays the first-use costs of every segment; p50 / p90 / CPU
+ms, A then B): `plain` 3.8 / 12.1 / 8.6 to 3.6 / 10.0 / 8.9; `all3+bm25` 4.5 / 8.0 / 15.5 to 3.2 / 10.5 / 8.3 (CPU 1.87 times);
+`any3+bm25` 5.3 / 10.5 / 12.8 to 6.0 / 8.8 / 10.9; `seq+bm25` 4.7 / 9.8 / 15.6 to 4.1 / 11.6 / 8.4 (CPU 1.86); `all1q+bm25` 5.4 / 9.2 /
+10.4 to 4.3 / 7.1 / 6.1 (1.70); `all2q+bm25` 5.7 / 8.3 / 11.8 to 3.0 / 5.7 / 3.9 (**1.86 times p50**, CPU 3.03); `any3q+bm25`
+5.6 / 10.5 / 9.8 to 4.5 / 7.6 / 8.3; `all2c+bm25` 3.4 / 6.8 / 6.4 to 4.0 / 8.0 / 6.3; `any2m+bm25` 4.6 / 7.2 / 6.6 to 4.1 / 7.0 / 5.9;
+`seqc+bm25` 4.5 / 9.2 / 30.3 to 4.8 / 15.8 / 28.3; `per1` 174.6 / 252.8 / 544 to 36.9 / 53.6 / 114 (4.73 times, CPU 4.75); `per3`
+179.0 / 255.7 / 539 to 35.9 / 55.5 / 111 (4.99, CPU 4.85). Cold here means a fresh process on warm local files; cold S3 was not measured.
+
+### Against the pass criteria
+
+- **`limit.per` at least 2 times: passes** (4.3 to 5.0 times at p50, warm and cold, 1 and 16 clients), identical IDs and scores.
+- **Token-filter shapes at least 2 times: partly.** The all-tokens shapes with unseen tokens pass (`all3` 2.46 times, `all2q` 2.01 times at
+  p50; 3.3 times CPU); `seq` and `all1q` reach 1.5 to 1.9 times; the any-token and common-token shapes reach 1.0 to 1.4 times. The reason is
+  below: the old filter cost on this fixture was 1 to 3 ms, so no filter shape could be more than about 1.6 times faster than plain BM25
+  at p50 (`plain` is 2.9 to 4.5 ms here, and every filtered shape was 3 to 8 ms).
+- **No other shape slower:** `plain` and the common-token shapes are within noise (CPU 0.97 to 1.12); identical answers everywhere.
+
+### The fused search that was built and killed (item 1 as written)
+
+I built the brief's design: `bf-text`'s `search_internal` takes boolean token predicates on its own field, decodes the tokens with at most 32
+posting blocks up front (intersecting them into the allowed set, so a selective filter drives the candidates), and probes the larger tokens
+and the phrase positions only for the candidates of windows that survive the BM25 bounds (a per-window verifier with a posting-block
+prefetch a few windows ahead, and a position-block cache shared across windows). `indexed.rs` split the filter's top-level conjuncts into
+those predicates and the rest for a plain BM25 list answer. It was exact: a debug differential test (21 filters, 5 queries, segments, a WAL
+tail with overwrites and deletes, and a reindex, against `query_exhaustive`) passed, and the answers of all 18 measured shapes matched the
+baseline in IDs and scores. It was **slower on every shape with a large token**, by server CPU per query (3 fresh-process rounds,
+1 client; a first version that read filter blocks for every window of a batch was no better, `seq+bm25` 37.0 ms): `all2c+bm25` 4.9 to 29.9 ms,
+`seqc+bm25` 6.8 to 153 ms, `any2m+bm25` 6.0 to 15.7 ms, `seq+bm25` 2.3 to 35.8 ms, and no shape gained. Killed, and the code is not in the tree.
+
+Why. The premise (the filter's posting decode is most of the cost) does not hold at this size: a token's postings are at most a few thousand
+blocks of 128 rows, a block decodes in about a microsecond, and the same blocks are already in the decoded-postings memo when the BM25
+query shares the token. A filter on `the and` costs about 0.6 ms of CPU more than plain BM25 (5.6 against 5.0), and a filter that ranks well
+(`all2q`) lets the floor rise at once, so the fused path has little to save there. Where the floor rises slowly (a rare phrase, a filter few BM25 hits pass), it visits many windows, and
+each visit pays a binary search per token and, for a phrase, a positions read: far more than one pass over the postings. I did not
+reproduce BW27's 5.7 ms for `3 tokens + BM25` against 1.18 ms for plain BM25 (here plain BM25 is 2.9 to 4.5 ms); in fresh processes the
+v0.1.78 `all3+bm25` is 8.2 ms p50 and 3.3 ms after the full-range fix, so that fix plausibly was most of the gap.
+
+### Item 3: the per-document token budget bound
+
+Not built. `bench/scale/bw29_budget.py` replays the first 150 held-out MS MARCO queries (2 to 13 distinct terms, 1M rows, 128-row windows,
+exact BM25 with each term's per-window maximum, `k = 10`) and caps each window's bound at the shared-budget maximum over every document
+length in the window: `max over L in [Lmin, Lmax] of max { sum w_t S(tf_t, L) : tf_t <= tfmax_t, sum tf_t <= L }`, which is exact for the greedy
+by concavity. The budget binds in 47 percent of the windows that the existing bound visits (61,229 of 129,770), because a window's shortest
+document is short, but the **bound prunes none of them**: windows visited 129,770 with the existing bound and 129,770 with the cap
+(0.0 percent more; by term count 2 to 13: all zero). The cap takes the best document length in the window, so a long document in the window probably raises it back to the existing bound. The brief asked
+for at least 20 percent, so nothing was built.
+
+### Tests
+
+`tests/limit_per_codes.rs` (string group with null and missing values, integer, non-filterable, and array groups, two attributes, four page
+shapes, three queries, segments, a WAL tail with patches and deletes, and a reindex, against `query_exhaustive`, scores included) and
+`tests/token_filters.rs` (21 token filters: all, any, and sequence tokens, prefixes, absent and empty queries, `And` of a token filter and
+another, nested `And`, `Not` and `Or`; four BM25 queries each; the same three phases). The existing `rank_shapes` tests exercise the
+code path on a uint group (`n`) in four page shapes and passed.
+
+### Not done
+
+Cold S3 and EC2 were not measured (local only, as briefed). A `limit.per` over two attributes, an array group, and a non-filterable group
+keep the column path (about 130 to 210 ms here). Each `cat` code array is 2 bytes a row (2 MB per 1M rows) and is charged to the decoded
+cache, so it can be evicted and rebuilt from the cached dictionary.
