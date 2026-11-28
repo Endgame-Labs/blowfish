@@ -1573,72 +1573,32 @@ async fn ranked_rows(
     };
     let (ef, shortlist) = plan(k, ef);
     let (hits, evaluations) = match (scan, mask) {
-        (true, Some(allowed)) => {
+        (true, Some(allowed)) => entry
+            .graph
+            .scan(
+                vector,
+                scan_shortlist(k),
+                scan_screen(k),
+                allowed,
+                crate::fan_out(),
+            )
+            .map_err(segment::index_error)?,
+        (true, None) => return Ok(None),
+        (false, _) => {
             let switch = g28_switch();
-            let seeded = if switch.contains("seed")
-                && allowed.len() * 1000 >= entry.graph.len() as u64 * g28_param(&switch, "min", 30)
-            {
+            if switch.contains("heap") && ef >= g28_param(&switch, "wide", 512) as usize {
                 entry
                     .graph
-                    .filtered_walk(
+                    .candidates_wide_with_norms(
                         vector,
-                        g28_param(&switch, "ef", 96) as usize,
-                        scan_shortlist(k),
-                        allowed,
-                        g28_param(&switch, "stride", 128) as usize,
-                        g28_param(&switch, "seeds", 8) as usize,
-                        g28_param(&switch, "cap", 3000) as usize,
+                        ef,
+                        shortlist,
+                        mask,
                         loan.scratch.as_mut().unwrap(),
                     )
                     .map_err(segment::index_error)?
             } else {
-                None
-            };
-            match seeded {
-                Some(found) => found,
-                None => entry
-                    .graph
-                    .scan(
-                        vector,
-                        scan_shortlist(k),
-                        scan_screen(k),
-                        allowed,
-                        crate::fan_out(),
-                    )
-                    .map_err(segment::index_error)?,
-            }
-        }
-        (true, None) => return Ok(None),
-        (false, _) => {
-            // TEMPORARY (Round G28): a filtered query's walk that returns only allowed rows, in
-            // place of the widened post-filter beam.
-            let switch = g28_switch();
-            let filtered = match mask {
-                Some(allowed)
-                    if switch.contains("fwalk")
-                        && allowed.len() * 10 < entry.graph.len() as u64 * 9
-                        && allowed.len() * 100
-                            >= entry.graph.len() as u64 * g28_param(&switch, "fmin", 8) =>
-                {
-                    entry
-                        .graph
-                        .filtered_walk(
-                            vector,
-                            g28_param(&switch, "fef", 96) as usize,
-                            shortlist,
-                            allowed,
-                            g28_param(&switch, "stride", 128) as usize,
-                            g28_param(&switch, "seeds", 8) as usize,
-                            g28_param(&switch, "fcap", 6000) as usize,
-                            loan.scratch.as_mut().unwrap(),
-                        )
-                        .map_err(segment::index_error)?
-                }
-                _ => None,
-            };
-            match filtered {
-                Some(found) => found,
-                None => entry
+                entry
                     .graph
                     .candidates_with_norms(
                         vector,
@@ -1647,7 +1607,7 @@ async fn ranked_rows(
                         mask,
                         loan.scratch.as_mut().unwrap(),
                     )
-                    .map_err(segment::index_error)?,
+                    .map_err(segment::index_error)?
             }
         }
     };

@@ -100,15 +100,6 @@ impl<'a> Screen<'a> {
         h > tail.saturating_add(self.margin)
     }
 }
-/// What a [`Scratch::filtered_search`] found.
-pub struct Filtered {
-    /// The nearest matching nodes, nearest first (at most `ef`).
-    pub hits: Vec<Hit>,
-    /// Scores computed.
-    pub evaluations: usize,
-    /// Whether the evaluation cap ended the search before its frontier was exhausted.
-    pub capped: bool,
-}
 /// Reusable, exact visitation and one sorted beam. Its owner reserves retained capacity.
 pub struct Scratch {
     visited: Visited,
@@ -167,56 +158,37 @@ impl Scratch {
         );
         (self.beam.iter().map(|b| b.hit).collect(), evaluations)
     }
-    /// A beam search that returns only nodes `matches` accepts. Every node is a stepping stone,
-    /// so the walk keeps its connectivity under any filter, but only matching nodes enter the
-    /// `ef` results. It starts from `seeds` (scored here) and stops when the nearest unexpanded
-    /// node is farther than the farthest of `ef` matching results, or after `max_evaluations`
-    /// scores.
-    #[allow(clippy::too_many_arguments)]
-    pub fn filtered_search(
+    /// A beam search for a wide beam (`ef` in the hundreds or more): the nearest unexpanded node
+    /// comes from a min-heap and the `ef` nearest scored nodes live in a max-heap, so each of the
+    /// search's scores costs `O(log ef)`, where a sorted beam moves up to `ef` entries to insert
+    /// one. It expands the same nodes in the same order and returns the same nearest `ef` nodes
+    /// as [`Self::search_prefetched`] without a screen (a screen reads the beam's tail, which a
+    /// heap does not keep). Returns the nodes nearest first and the number of scores.
+    pub fn search_wide(
         &mut self,
         links: &[[u32; 34]],
         degrees: &[u8],
-        seeds: &[u32],
+        entry: u32,
         ef: usize,
-        max_evaluations: usize,
         mut score: impl FnMut(u32) -> f32,
         mut prefetch: impl FnMut(u32),
-        mut matches: impl FnMut(u32) -> bool,
-    ) -> Filtered {
+    ) -> (Vec<Hit>, usize) {
         use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
         self.visited.begin();
-        let mut frontier: std::collections::BinaryHeap<Reverse<Hit>> = Default::default();
-        let mut found: Vec<Hit> = Vec::with_capacity(ef + 1);
-        let mut evaluations = 0;
-        let offer = |hit: Hit, found: &mut Vec<Hit>| {
-            if found.len() < ef || hit < *found.last().unwrap() {
-                let at = found.partition_point(|h| *h < hit);
-                found.insert(at, hit);
-                found.truncate(ef);
-            }
+        self.visited.insert(entry);
+        let start = Hit {
+            id: entry,
+            distance: score(entry),
         };
-        for &id in seeds {
-            if self.visited.insert(id) {
-                let hit = Hit {
-                    id,
-                    distance: score(id),
-                };
-                evaluations += 1;
-                frontier.push(Reverse(hit));
-                if matches(id) {
-                    offer(hit, &mut found);
-                }
-            }
-        }
+        let mut frontier: BinaryHeap<Reverse<Hit>> = BinaryHeap::with_capacity(ef.min(1 << 16));
+        let mut found: BinaryHeap<Hit> = BinaryHeap::with_capacity(ef.min(1 << 16) + 1);
+        frontier.push(Reverse(start));
+        found.push(start);
+        let mut evaluations = 1;
         let mut pending = [0u32; MAX_LINKS];
-        let mut capped = false;
         while let Some(Reverse(current)) = frontier.pop() {
-            if found.len() >= ef && current > *found.last().unwrap() {
-                break;
-            }
-            if evaluations >= max_evaluations {
-                capped = true;
+            if found.len() >= ef && current > *found.peek().unwrap() {
                 break;
             }
             let degree = degrees[current.id as usize] as usize;
@@ -228,7 +200,7 @@ impl Scratch {
                 }
             }
             for position in 0..count {
-                if let Some(&next) = pending[..count].get(position + 2) {
+                if let Some(&next) = pending[..count].get(position + 3) {
                     prefetch(next);
                 }
                 let id = pending[position];
@@ -237,20 +209,16 @@ impl Scratch {
                     distance: score(id),
                 };
                 evaluations += 1;
-                // A node farther than every kept result and the frontier's nearest can still lead
-                // somewhere, so it joins the frontier unless the results are full and it is worse
-                // than their farthest by the time it would be expanded (the pop test).
-                frontier.push(Reverse(hit));
-                if matches(id) {
-                    offer(hit, &mut found);
+                if found.len() < ef || hit < *found.peek().unwrap() {
+                    frontier.push(Reverse(hit));
+                    found.push(hit);
+                    if found.len() > ef {
+                        found.pop();
+                    }
                 }
             }
         }
-        Filtered {
-            hits: found,
-            evaluations,
-            capped,
-        }
+        (found.into_sorted_vec(), evaluations)
     }
     /// The shared beam search, for serving and for graph construction. `adjacent` copies one
     /// node's neighbors into the buffer and returns their count (at most [`MAX_LINKS`]).

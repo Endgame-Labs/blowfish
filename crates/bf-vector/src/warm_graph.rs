@@ -247,78 +247,6 @@ impl HotGraph {
             scanned,
         ))
     }
-    /// Answer a filtered query from a walk over the whole graph that returns only `allowed` rows,
-    /// seeded from a sample of them. Every `stride`th allowed row is ranked by the Hamming
-    /// distance of its one-bit code to the query's signs, and the nearest `seeds` begin the walk,
-    /// which keeps the `ef` nearest allowed nodes and stops after `max_evaluations` scores.
-    /// Returns the `count` nearest of them (row and cached norm) with the scores computed, or
-    /// `None` when the evaluation cap ended the walk before `count` rows were found.
-    #[allow(clippy::too_many_arguments)]
-    pub fn filtered_walk(
-        &self,
-        query: &[f32],
-        ef: usize,
-        count: usize,
-        allowed: &RoaringBitmap,
-        stride: usize,
-        seeds: usize,
-        max_evaluations: usize,
-        scratch: &mut HotScratch,
-    ) -> Result<Option<(Vec<(u32, crate::CosineNorm)>, usize)>> {
-        crate::distance::validate(query, self.dims)?;
-        if ef == 0 || count == 0 || self.nodes.is_empty() || query.iter().all(|x| *x == 0.) {
-            return Err(Error::InvalidInput("unsupported graph query shape".into()));
-        }
-        let q = vectors::normalized(query);
-        let rotated = rabitq::RaBitQ::new(q.len(), 42)?.rotate(&q);
-        let (code, scale) = quant::encode(&rotated);
-        let signs = self.bits.query(&rotated);
-        // The sample: evenly spaced allowed rows, ranked by their one-bit codes.
-        let stride = stride.max(1);
-        let mut sample: Vec<(u16, u32)> = Vec::with_capacity(allowed.len() as usize / stride + 1);
-        let mut i = 0;
-        while let Some(row) = allowed.select(i) {
-            if let Some(&node) = self.nodes.get(row as usize)
-                && node != u32::MAX
-            {
-                sample.push((self.bits.hamming(&signs, node), node));
-            }
-            i = i.saturating_add(stride as u32);
-            if u64::from(i) >= allowed.len() {
-                break;
-            }
-        }
-        if sample.is_empty() {
-            return Ok(None);
-        }
-        let seeds = seeds.max(1).min(sample.len());
-        if sample.len() > seeds {
-            sample.select_nth_unstable(seeds - 1);
-            sample.truncate(seeds);
-        }
-        let seeds: Vec<u32> = sample.into_iter().map(|(_, node)| node).collect();
-        let found = scratch.0.filtered_search(
-            &self.links,
-            &self.degrees,
-            &seeds,
-            ef.max(count),
-            max_evaluations,
-            |id| self.codes.score(&code, scale, id),
-            |id| self.codes.prefetch(id),
-            |id| allowed.contains(self.rows[id as usize]),
-        );
-        if found.hits.len() < count && found.capped {
-            return Ok(None);
-        }
-        let mut hits = found.hits;
-        hits.truncate(count);
-        Ok(Some((
-            hits.into_iter()
-                .map(|h| (self.rows[h.id as usize], self.norms[h.id as usize]))
-                .collect(),
-            found.evaluations,
-        )))
-    }
     /// Allocate cache-sized visitation state. Callers bound and reserve the number retained.
     pub fn scratch(&self) -> HotScratch {
         HotScratch(navigation::Scratch::new(self.len()))
@@ -335,6 +263,48 @@ impl HotGraph {
     ) -> Result<(Vec<u32>, usize)> {
         let (hits, evaluations) = self.candidates_with_norms(query, ef, count, live, scratch)?;
         Ok((hits.into_iter().map(|(row, _)| row).collect(), evaluations))
+    }
+    /// [`Self::candidates_with_norms`] with the wide-beam search (see
+    /// [`navigation::Scratch::search_wide`]): no one-bit screen, and a heap beam, which is much
+    /// cheaper for a beam in the thousands.
+    pub fn candidates_wide_with_norms(
+        &self,
+        query: &[f32],
+        ef: usize,
+        count: usize,
+        live: Option<&RoaringBitmap>,
+        scratch: &mut HotScratch,
+    ) -> Result<(Vec<(u32, crate::CosineNorm)>, usize)> {
+        crate::distance::validate(query, self.dims)?;
+        if ef == 0 || count == 0 || query.iter().all(|x| *x == 0.) {
+            return Err(Error::InvalidInput("unsupported graph query shape".into()));
+        }
+        let q = vectors::normalized(query);
+        let rotated = rabitq::RaBitQ::new(q.len(), 42)?.rotate(&q);
+        let (code, scale) = quant::encode(&rotated);
+        let entry = self
+            .entries
+            .iter()
+            .map(|&id| (id, self.codes.score(&code, scale, id)))
+            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
+            .unwrap()
+            .0;
+        let (mut hits, evaluations) = scratch.0.search_wide(
+            &self.links,
+            &self.degrees,
+            entry,
+            ef.max(count).min(self.len()),
+            |id| self.codes.score(&code, scale, id),
+            |id| self.codes.prefetch(id),
+        );
+        hits.retain(|h| live.is_none_or(|m| m.contains(self.rows[h.id as usize])));
+        hits.truncate(count);
+        Ok((
+            hits.into_iter()
+                .map(|h| (self.rows[h.id as usize], self.norms[h.id as usize]))
+                .collect(),
+            evaluations + self.entries.len(),
+        ))
     }
     /// Navigate identically to [`Self::candidates`], carrying each immutable row's cached norm
     /// for exact reranking. Norms describe original stored f16 values, before normalization.
@@ -551,9 +521,9 @@ mod tests {
         assert!(graph.scan(query, 0, usize::MAX, &all, true).is_err());
     }
     #[test]
-    fn filtered_walk_returns_only_allowed_rows_in_order_and_matches_the_scan_on_a_small_graph() {
-        let (dims, n) = (16, 400);
-        let mut seed = 9u64;
+    fn wide_search_returns_the_same_nodes_as_the_sorted_beam() {
+        let (dims, n) = (16, 900);
+        let mut seed = 21u64;
         let source = (0..n)
             .map(|_| {
                 (0..dims)
@@ -567,8 +537,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut b = HotGraphBuilder::new(dims, n).unwrap();
-        let row = |i: usize| ((i * 7) % n) as u32 + 5;
-        let ids = (0..n).map(row).collect::<Vec<_>>();
+        let ids = (0..n as u32).map(|i| i + 10).collect::<Vec<_>>();
         let packed = source
             .iter()
             .flatten()
@@ -576,51 +545,46 @@ mod tests {
             .collect::<Vec<_>>();
         b.append(&ids, &packed, &|| false).unwrap();
         let graph = b.finish(&|| false).unwrap();
-        let mut scratch = graph.scratch();
-        // A tenth of the rows, scattered; and the rows with an even number.
-        let tenth = (0..n)
-            .map(row)
-            .filter(|r| r % 10 == 3)
-            .collect::<RoaringBitmap>();
-        let even = (0..n)
-            .map(row)
-            .filter(|r| r % 2 == 0)
-            .collect::<RoaringBitmap>();
-        for allowed in [&tenth, &even] {
-            for q in [3, 41, 200, 399] {
-                let (hits, evaluations) = graph
-                    .filtered_walk(&source[q], 64, 10, allowed, 4, 4, usize::MAX, &mut scratch)
+        let mut beam = graph.scratch();
+        let mut wide = graph.scratch();
+        for q in [0, 5, 77, 300, 899] {
+            let (code, scale) = quant::encode(
+                &rabitq::RaBitQ::new(dims, 42)
                     .unwrap()
-                    .expect("an uncapped walk finds ten rows");
-                assert_eq!(hits.len(), 10);
-                assert!(hits.iter().all(|(r, _)| allowed.contains(*r)));
-                assert!(evaluations > 0 && evaluations <= n);
-                // The same nodes as an exhaustive scan, in the same order, on this small graph
-                // (the walk's frontier reaches every node here).
-                let (scanned, _) = graph
-                    .scan(&source[q], 10, usize::MAX, allowed, false)
-                    .unwrap();
-                let walked = hits.iter().map(|h| h.0).collect::<Vec<_>>();
-                let truth = scanned.iter().map(|h| h.0).collect::<Vec<_>>();
-                let shared = walked.iter().filter(|r| truth.contains(r)).count();
-                assert!(shared >= 9, "walk and scan share {shared} of 10 rows");
+                    .rotate(&vectors::normalized(&source[q])),
+            );
+            let entry = graph.entries[0];
+            for ef in [1, 10, 64, 300, 900] {
+                let (a, _) = beam
+                    .0
+                    .search(&graph.links, &graph.degrees, entry, ef, |id| {
+                        graph.codes.score(&code, scale, id)
+                    });
+                let (w, _) = wide.0.search_wide(
+                    &graph.links,
+                    &graph.degrees,
+                    entry,
+                    ef,
+                    |id| graph.codes.score(&code, scale, id),
+                    |_| {},
+                );
+                assert_eq!(
+                    a.iter().map(|h| h.id).collect::<Vec<_>>(),
+                    w.iter().map(|h| h.id).collect::<Vec<_>>(),
+                    "query {q} ef {ef}"
+                );
             }
+            // And through the public method with a mask.
+            let live = (0..n as u32)
+                .map(|i| i + 10)
+                .filter(|r| r % 3 != 0)
+                .collect::<RoaringBitmap>();
+            let (hits, _) = graph
+                .candidates_wide_with_norms(&source[q], 300, 20, Some(&live), &mut wide)
+                .unwrap();
+            assert_eq!(hits.len(), 20);
+            assert!(hits.iter().all(|(r, _)| live.contains(*r)));
         }
-        // A cap that ends the walk before it finds `count` rows is a decline, not a short answer.
-        assert!(
-            graph
-                .filtered_walk(&source[3], 64, 10, &tenth, 4, 1, 3, &mut scratch)
-                .unwrap()
-                .is_none()
-        );
-        // Nothing allowed.
-        let none = RoaringBitmap::from_iter([0, 1]);
-        assert!(
-            graph
-                .filtered_walk(&source[3], 64, 10, &none, 1, 1, usize::MAX, &mut scratch)
-                .unwrap()
-                .is_none()
-        );
     }
     #[test]
     fn one_bit_screen_keeps_the_nearest_rows_and_the_exact_shortlist_size() {
