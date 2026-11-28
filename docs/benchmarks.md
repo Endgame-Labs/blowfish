@@ -19726,7 +19726,7 @@ Each set holds 96 objects of 64 MiB (16 KiB ranges on 64 of them, a 4 GiB span),
 
 ### c44-model: replay of the 10M rerank wave
 
-`c44_model.py`: per query, the rerank wave is the `slabs` reads that start after the `scan` stage and end by the `rerank vectors` stage (47 reads at the median unfiltered, 94 filtered; the 7.9 percent filter reads the same pages as the unfiltered query plus its scan, so the wave is the same size class). Each layout turns those reads into GETs (ranges as traced; one GET per 16 KiB page; one per distinct 64 KiB or 256 KiB group touched), draws each GET's last-byte time by resampling whole measured waves of 35 for that layout and age, and takes the wave's maximum from the read's traced start. Modeled query = traced time with the wave replaced. 20 resamples per query. Per-million-row cost: 1,024-d f16 is 2 KiB per row, 8 rows per 16 KiB page, PUT $0.005 per 1,000.
+`c44_model.py`: per query, the rerank wave is the `slabs` reads that start after the `scan` stage and end by the `rerank vectors` stage (47 reads at the median unfiltered, 94 filtered). Each layout turns those reads into GETs (ranges as traced; one GET per 16 KiB page; one per distinct 64 KiB or 256 KiB group touched), draws each GET's last-byte time by resampling whole measured waves of 35 for that layout and age, and takes the wave's maximum from the read's traced start. Modeled query = traced time with the wave replaced. 20 resamples per query. Per-million-row cost: 1,024-d f16 is 2 KiB per row, 8 rows per 16 KiB page, PUT $0.005 per 1,000.
 
 Unfiltered `top_k` 10 (traced p50 233 / p90 290 ms, wave 115 / 147 ms):
 
