@@ -2064,10 +2064,6 @@ async fn filter_masks_are_one_cached_entry_that_follows_the_segments() {
     e.index_namespace("hot", true).await.unwrap();
     let (_, after) = masks(json!(["bucket", "Eq", 3])).await;
     assert_eq!(total(&after), 120 - 3);
-    assert!(
-        after
-            .iter()
-            .flatten()
-            .all(|b| !b.contains(3) || b.len() < 60)
-    );
+    let segment = |i: usize| after[i].as_ref().unwrap();
+    assert!(!segment(0).contains(3) && !segment(0).contains(13) && !segment(1).contains(3));
 }
