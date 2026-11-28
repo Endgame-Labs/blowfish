@@ -1045,6 +1045,12 @@ async fn prepare_segment(
         && q.rank_by
             .as_ref()
             .is_some_and(crate::ordinal_scan::eligible);
+    // A `limit.per` over one clause searches for just the rows its groups need (see `GroupedSearch`).
+    let grouped = if streaming && !clause_top {
+        crate::ordinal_scan::GroupedSearch::plan(store, state, q, seg, clauses).await?
+    } else {
+        None
+    };
     let mut selected = if all && !streaming {
         allowed.clone()
     } else {
@@ -1116,6 +1122,12 @@ async fn prepare_segment(
                     }
                     top = top.saturating_mul(2);
                 }
+            } else if let Some(grouped) = &grouped {
+                grouped
+                    .hits(&allowed, |k| {
+                        reader.search_prefetched(&query, stats, &cfg, k, Some(&allowed))
+                    })
+                    .await
             } else if let Some(threshold) = threshold {
                 reader
                     .search_prefetched_shared(

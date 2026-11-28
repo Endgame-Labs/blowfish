@@ -84,3 +84,59 @@ async fn limit_per_by_group_code_matches_full_scoring() {
     e.index_namespace("t", true).await.unwrap();
     compare_all(&e, "reindexed").await;
 }
+
+/// More matching rows than the first bounded search reads, with one group whose rows all score far
+/// below the rest: the search must widen until that group is full, and a group that only has
+/// low-scoring rows (or none that match) must still come out right.
+#[tokio::test]
+async fn bounded_group_search_widens_until_every_group_is_full() {
+    let rows = |ids: std::ops::Range<u64>| -> Vec<Value> {
+        ids.map(|id| {
+            let g = id % 7;
+            // Group 6 pads its text, so BM25 ranks it below every other group; group 5 never
+            // matches "common"; ties are everywhere (two texts per group).
+            let words = match g {
+                6 => format!("common {}", "pad ".repeat(60)),
+                5 => "unrelated words".to_string(),
+                _ => format!(
+                    "common {}",
+                    if id % 2 == 0 { "alpha" } else { "alpha beta" }
+                ),
+            };
+            json!({"id": id, "text": words, "g": g, "h": id % 3})
+        })
+        .collect()
+    };
+    let e = node().await;
+    write(
+        &e,
+        json!({"schema": {"text": {"type": "string", "full_text_search": true},
+            "g": {"type": "uint", "filterable": true}, "h": {"type": "uint", "filterable": true}},
+            "upsert_rows": rows(0..2800)}),
+    )
+    .await;
+    e.index_namespace("t", true).await.unwrap();
+    write(
+        &e,
+        json!({"upsert_rows": rows(2800..3600), "deletes": [6, 13, 20, 4000]}),
+    )
+    .await;
+    for phase in ["segments", "reindexed"] {
+        for query in ["common", "common alpha", "alpha beta", "pad"] {
+            for attributes in [vec!["g"], vec!["h"], vec!["g", "h"]] {
+                for (total, per, offset) in [(10, 1, 0), (10, 3, 2), (4, 2, 0)] {
+                    let q = json!({"rank_by": clause(query), "limit": {"total": total,
+                        "per": {"attributes": attributes, "limit": per}}, "offset": offset,
+                        "include_attributes": ["g"]});
+                    identical(
+                        &e,
+                        q,
+                        &format!("{phase} {query} per {attributes:?} {total}/{per}+{offset}"),
+                    )
+                    .await;
+                }
+            }
+        }
+        e.index_namespace("t", true).await.unwrap();
+    }
+}

@@ -172,6 +172,95 @@ async fn tuple_codes(
     }))
 }
 
+/// A `limit.per` over one BM25 clause whose groups all have integer codes: the segment's contenders
+/// then come from a bounded top-K search that widens until every group is full, instead of scoring
+/// every matching row.
+pub(crate) struct GroupedSearch {
+    codes: TupleCodes,
+    per: usize,
+}
+/// Rows the first bounded search asks for; each widening multiplies it by [`WIDEN`].
+const FIRST_K: usize = 512;
+const WIDEN: usize = 4;
+impl GroupedSearch {
+    /// The plan for this query and segment, or `None` when the exhaustive scorer must run: the
+    /// rank is not one plain BM25 clause, there is no `limit.per`, or a group has no integer code
+    /// (or the tuple space is too big for a direct table).
+    pub(crate) async fn plan(
+        store: &Storage,
+        state: &NamespaceState,
+        q: &QueryRequest,
+        seg: &bf_wal::Segment,
+        clauses: &[&RankBy],
+    ) -> Result<Option<Self>, ApiError> {
+        let (Some(per), Some(rank)) = (q.limit.as_ref().and_then(Limit::per), q.rank_by.as_ref())
+        else {
+            return Ok(None);
+        };
+        if per.limit == 0 || clauses.len() != 1 || !matches!(rank, RankBy::Bm25 { .. }) {
+            return Ok(None);
+        }
+        let rows = segment::ids(store, seg).await?.len();
+        Ok(tuple_codes(store, state, seg, &per.attributes, rows)
+            .await?
+            .filter(TupleCodes::dense)
+            .map(|codes| Self {
+                codes,
+                per: per.limit,
+            }))
+    }
+
+    /// Every hit `select` needs from `search(k)` (the exact best `k` hits of the clause among the
+    /// allowed rows, ties broken by row): all hits scoring above the `k`th are present, so once every
+    /// group that has an allowed row holds `per` of them, the lower rows cannot place in their groups,
+    /// and the answer equals the one from every hit. Otherwise `k` grows until the list is the whole
+    /// result.
+    pub(crate) async fn hits<F, Fut>(
+        &self,
+        allowed: &RoaringBitmap,
+        mut search: F,
+    ) -> std::io::Result<Vec<bf_text::SearchHit>>
+    where
+        F: FnMut(usize) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Vec<bf_text::SearchHit>>>,
+    {
+        let mut present: Option<Vec<bool>> = None;
+        let mut k = FIRST_K;
+        loop {
+            let mut hits = search(k).await?;
+            if hits.len() < k || k as u64 >= allowed.len() {
+                return Ok(hits);
+            }
+            // Rows tied with the last hit may be missing, so only the strictly better ones count.
+            let cut = hits.iter().map(|h| h.score).fold(f32::INFINITY, f32::min);
+            hits.retain(|h| h.score > cut);
+            let mut held = vec![0usize; self.codes.space as usize];
+            for h in &hits {
+                held[self.codes.tuple(h.row) as usize] += 1;
+            }
+            if held.iter().all(|&n| n >= self.per) {
+                return Ok(hits);
+            }
+            // A group short of `per` is fine when no allowed row belongs to it.
+            let present = present.get_or_insert_with(|| {
+                let mut present = vec![false; self.codes.space as usize];
+                for row in allowed {
+                    present[self.codes.tuple(row) as usize] = true;
+                }
+                present
+            });
+            if held
+                .iter()
+                .zip(present.iter())
+                .all(|(&n, &here)| n >= self.per || !here)
+            {
+                return Ok(hits);
+            }
+            k = k.saturating_mul(WIDEN);
+        }
+    }
+}
+
 /// The segment's rows that can appear in the answer: its best `k` rows by score (ties by ID), or
 /// each group's best `per.limit` rows under `limit.per`. `hits` holds each clause's hits (every
 /// matching row) in `clauses` order. Rows scoring 0 or less never rank, as in the full scorer.
