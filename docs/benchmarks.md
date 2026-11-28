@@ -18193,6 +18193,71 @@ find vectors in full-size cache blocks (it reads 16 KB blocks cached apart from 
 
 One c7gn.4xlarge on demand for about 0.5 hours plus the 77 GB server-side copy (deleted): under $1. The instance, key pair, security group, and the S3 prefix are deleted.
 
+## Round C35: scoring the nearest leaves exactly in the first wave does not remove the rerank wave (killed offline, no engine change)
+
+Neon's idea (22:25 #4): read each of the nearest M probed leaves whole (codes and exact vectors) in the first wave, score them exactly, and prune
+the other probed leaves' candidates against that exact k-th distance, so the rerank wave shrinks to 0 to 2 reads. The offline test says it does not:
+at M of 16 the median query still needs 8 second-wave reads, and the modeled saving is 26 ms at p50 against a 50 ms bar. **Killed; no format or
+engine change.** `c35_sim.py` and `c35_s3wave.py` are kept. The candidate dump below was a temporary hook on the round's branch and is not in the engine (one way per thing).
+
+Measured 2026-11-27 on one on-demand c7gn.4xlarge (us-west-2, about 2 h, a private server-side copy of the C5 10M fixture repaired by the baseline
+writer: 55 row maps, 319 manifests), v0.1.76. 200 cold unfiltered `top_k` 10 queries (oracle queries 0-199), 64 probes, caches dropped before each.
+
+### Method
+
+With a temporary dump hook (on the round's branch only), every scan ran without its running bound (so every row of every probed leaf is a candidate), and the engine appends one line
+per query: the probed leaves in plan order (center distance, rows, byte ranges) and every candidate's RaBitQ estimate, error bound, and exact
+distance (median 226,283 candidates per query, 64 leaves). `c35_sim.py` then replays each query offline:
+
+- **Baseline** is today's rerank: candidates whose lower bound (estimate minus error) is within the k-th smallest upper bound. It reproduces the
+  trace: a median pool of 56 rows read in **34 reads** (C34 measured about 35), and its modeled wave is 117 ms at p50 (C34 measured 100-135 ms).
+- **Candidate M**: the nearest M leaves (by center distance) are scored exactly in the first wave; D is their exact k-th distance; every candidate
+  in the other leaves with lower bound at most D is read in a second wave. Reads merge as the engine's rerank merges them.
+- **Wave time** is not an assumed distribution: `c35_s3wave.py` started n cold 16 KB reads together at random offsets of the 10M slabs and timed the
+  last byte (60 trials per n).
+
+| n parallel cold 16 KB reads | 1 | 2 | 4 | 8 | 16 | 24 | 35 | 48 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| wave p50, ms | 57 | 76 | 93 | 100 | 107 | 113 | 123 | 124 |
+| wave p90, ms | 111 | 111 | 117 | 127 | 127 | 154 | 173 | 165 |
+
+(1.3 MB reads, a leaf's vectors: 4 reads 101 / 147, 8 reads 114 / 155, 16 reads 132 / 158, 20 reads 134 / 178 ms at p50 / p90.) A single cold read
+already costs 57 ms at p50, so a wave helps only when it vanishes: one or two survivors still pay 57 to 76 ms.
+
+### Result (200 queries)
+
+| M | Surviving second-wave reads, median (p90) | Queries with none | Surviving rows, median | Modeled wave p50 / p90, ms | Saving p50 (mean), ms | First-wave vector bytes | Net bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| today | 34 | 0% | 56 | 117 / 152 | - | - | - |
+| 8 | 13 (81) | 12% | 16 | 105 / 142 | 19 (26) | 12.3 MB | +11.8 MB |
+| 12 | 9 (66) | 14% | 10 | 101 / 138 | 22 (30) | 18.0 MB | +17.6 MB |
+| 16 | **8** (50) | 18% | 8 | 97 / 135 | **26** (34) | 24.2 MB | +23.4 MB |
+| 20 | 7 (45) | 19% | 7 | 95 / 131 | 29 (38) | 30.0 MB | +29.2 MB |
+
+The top 10 equals the exact top 10 over all probed candidates in all 201 queries, for the baseline and for every M (the bound never failed on this set).
+
+**Kill rule** (median surviving reads above 4 at M of 16 or less, or p50 saving under 50 ms): both hold at M of 16 (8 reads, 26 ms).
+
+### Why it fails
+
+The exact k-th distance is barely tighter than the engine's k-th upper bound (D over U is 0.96 at the median for M from 8 to 20), because the k-th upper bound is
+already close to the true k-th distance. What survives is the rows whose lower bound is within the quantization error band of that distance, and they sit in
+leaves all over the probe list: scoring more near leaves exactly resolves only the contenders that happen to be in them. The surviving rows (7 to 16) land in
+different leaves and slabs, so they are 7 to 13 separate reads, and each wave's time is its slowest read. Going from M of 8 to 20 buys 10 ms
+and costs 17 MB more per query (M of 16 alone adds 24 percent to today's 97 MB). The idea needs the survivors to be 0 to 2 reads, and the error band
+makes that unreachable at any affordable M.
+
+### Not built
+
+The slab format version, the staging changes (`local_ann.rs`'s code-prefix staging and the 100M code-only case), the generation bump, and the paired
+measurement were not started: they depend on this result. A different lever would have to shrink the error band itself (more bits per code, or exact
+vectors for the few rows nearest the bound), which changes recall and bytes in other ways and is outside this round.
+
+### Cost
+
+One c7gn.4xlarge on demand for about 2 hours, plus the 77 GB server-side copy (deleted): about $3. The instance, key pair, security group, and the S3
+prefix `tmp/c35` are deleted.
+
 ## Round G21: the typed ID path serves UUID IDs (3.68 times at `top_k` 100) and engines with disk staging (item 3 not attempted)
 
 **Setup:** Round G18's machine (the Apple M4, shared Mac mini, 10 cores), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), but **loaded with UUID IDs**: `bench/nq/load.py --vectors-only --uuid-ids` writes
