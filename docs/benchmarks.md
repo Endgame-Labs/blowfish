@@ -18258,6 +18258,52 @@ vectors for the few rows nearest the bound), which changes recall and bytes in o
 One c7gn.4xlarge on demand for about 2 hours, plus the 77 GB server-side copy (deleted): about $3. The instance, key pair, security group, and the S3
 prefix `tmp/c35` are deleted.
 
+## Round C37: extra code bits do not certify the cold top 10, so the rerank wave stays (killed offline, no engine change)
+
+Neon's exact variant (00:25 #1): store a 3-bit extended RaBitQ extension (Gao and Long, SIGMOD 2025) beside each leaf's 1-bit codes, fetch it in the
+first wave, and certify the top 10 from the tighter bounds so the second wave of about 34 exact-vector reads vanishes. The offline test says it does not:
+with the 3-bit extension, **no query out of 201 certifies with zero reads** (median 10 rows still need an exact read). **Killed; no format or engine change.**
+`c37_dump.py` and `c37_sim.py` are kept. The dump hook (C35's candidate dump plus a record of rotated residuals) was temporary and is not in the engine.
+
+Measured 2026-11-28 on one on-demand c7gn.4xlarge (us-west-2, about 1 h), a private server-side copy of the C5 10M fixture repaired by the baseline writer (55 row
+maps), v0.1.77 plus the hook. 201 cold unfiltered `top_k` 10 queries (oracle queries 0-199, plus the warm-up query 199 again), 64 probes, caches dropped before each.
+
+### Method
+
+The hook dumps what C35 did (every candidate's 1-bit estimate, error bound, and exact distance, with no running bound), and for every row in the 1-bit pool
+(lower bound at most the k-th smallest upper bound: median 56 rows, p90 156) its rotated residual from its leaf center, plus the rotated query residual of each leaf.
+`c37_sim.py` then quantizes each pool row offline as extended RaBitQ does: a uniform grid of 2^(1+e) levels over the unit residual, with the scale that maximizes the
+code's cosine with the vector; the inner product is estimated as the code's dot with the query over the code's dot with the vector; and the bound is the engine's own formula with the new alpha
+(1.9 sigma, `2 |q-c| |r| sqrt(1-alpha^2) / (alpha sqrt(D-1))`). Sanity checks: the 1-bit estimate recomputed from the residuals matches the dump to 7e-4 (median relative), the metric factor is
+exactly 0.5 (cosine), and the new bounds cover the exact distance for 95.1 to 95.4 percent of pool rows (1.9 sigma is about 94 percent).
+
+A row is settled when the rows surely below it equal the rows that may be below it (order certified) or when it is surely in or out of the top 10 (set certified). Rows not settled are read exactly
+(their interval collapses) and the test repeats. Reads merge as the engine's rerank merges them. Extra first-wave bytes are every candidate (median 226,283 rows) times the extension size
+(`e * 128 + 8` bytes per row). Rows a query must decode are the pool: 56 at the median, 156 at p90 (the engine's running bound would decode somewhat more, never fewer).
+
+### Result (201 queries)
+
+| Extension | Code | B/row | First-wave extra, median (p90) | Bound band vs 1-bit | Order certified: rows to read, median (p90) | Zero reads | Reads, median | Set only: rows, median (p90) | Zero reads |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 bits | 3-bit | 264 | 59.7 MB (64.4) | 0.252x | 13 (19) | 0% | 10 | 8 (15) | 3% |
+| **3 bits** | 4-bit | 392 | **88.7 MB** (95.6) | 0.137x | **10** (14) | **0%** | 8 | 4 (9) | 16% |
+| 4 bits | 5-bit | 520 | 117.7 MB (126.8) | 0.073x | 7 (10) | 0% | 6 | 2 (5) | 36% |
+
+Today's baseline reads 34 times (56 rows). The answer is exact in set and order for all 201 queries at every width when order is certified. With the set only, the order was exact in 94, 98, and 124 of 201 queries (2, 3, and 4 bits).
+
+**Kill rule** (under 50 percent of queries with zero reads, or a median above 1, or over 120 MB extra per query): the first two hold at every width (0 percent zero, median 10 rows at 3 bits); bytes pass at 3 bits (89 MB).
+
+### Why it fails
+
+The bound narrows about 1.8 times per extra bit (0.25x, 0.14x, 0.07x), but ranks 1 to 10 are close in distance (I did not measure the gaps), so adjacent intervals still overlap at 4 bits.
+Ordering ten rows needs the band under the closest pair's gap, so a few rows always remain, and (as in C35) they lie in different leaves: still a cold wave of 6 to 10 reads, each at about 57 ms or more (C35's floor). Even if only membership mattered
+(the set-only rows), 3 bits leaves a median of 4 rows and 84 percent of queries with a wave. Neon's approximate variant (return the estimated order, no exact read)
+would remove the wave but changes the answer and the `$dist` values; that is a decision for Kyle, not measured here.
+
+### Cost
+
+One c7gn.4xlarge on demand for about 1 hour, plus the 77 GB server-side copy (deleted): about $1.5. The instance, key pair, security group, and the S3 prefix `tmp/c37` are deleted.
+
 ## Round G21: the typed ID path serves UUID IDs (3.68 times at `top_k` 100) and engines with disk staging (item 3 not attempted)
 
 **Setup:** Round G18's machine (the Apple M4, shared Mac mini, 10 cores), full BEIR NQ (2,681,468 rows, 1,024-d f16 cosine, 3,452 queries), but **loaded with UUID IDs**: `bench/nq/load.py --vectors-only --uuid-ids` writes
