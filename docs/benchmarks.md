@@ -19554,9 +19554,9 @@ twelve 16-client passes. Term-occurrence counters were a temporary patch, remove
 | Sparse (df at or below the threshold) | 808,670 | 55.1% |
 
 Of the 72,551 memo occurrences, about 17,000 are the rent period (each term's first use per segment, before the array is earned),
-so **about 55,700 occurrences (3.8% of all) are denied an array** by the cap or the budget. They spread over about 25
-(term, segment-size) pairs, the biggest being one term with 6,777. The slots are held by the genuinely frequent terms: the eight
-largest by document frequency (550,000 to 870,000 rows, the stopwords) account for about 60% of the dense occurrences, and the rest are
+so **about 55,700 occurrences (3.8% of all) are denied an array** by the cap or the budget. They spread over 35
+terms (by namespace document frequency, in the 60 most-used rows), the biggest with 6,777. The slots are held by the genuinely frequent terms: the eight
+largest by document frequency (550,000 to 870,000 rows, the stopwords) account for about 55% of the dense occurrences, and the rest are
 mid-frequency words (30,000 to 100,000 rows) that real queries do use. Slots do not go to rare terms, because a term must be dense
 (df above the sparse threshold) before it counts.
 
