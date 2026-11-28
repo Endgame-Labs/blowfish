@@ -4,6 +4,12 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 ## [Unreleased]
 
+## [0.1.80] - 2026-11-27
+
+### Changed
+
+- **BM25 with `limit.per` is 4 to 5 times faster, and BM25 with an all-tokens filter 2 to 2.5 times:** A BM25 query that keeps the best rows per group built a JSON key from each candidate's group value; it now uses each segment's integer codes for low-cardinality group columns, built once from the existing filter dictionary and counted in the cache's memory budget. A `ContainsAllTokens` or `ContainsTokenSequence` filter built a bitmap over every row before intersecting its tokens; it now starts from the first token's postings. On a million MS MARCO passages, `limit.per` is 4.3 to 5 times faster warm and cold, `ContainsAllTokens` plus BM25 2 to 2.5 times, and `ContainsTokenSequence` plus BM25 1.6 times, with identical results. See Round BW29 in `docs/benchmarks.md`.
+
 ## [0.1.79] - 2026-11-27
 
 ### Changed
@@ -573,7 +579,8 @@ Notable changes per release, newest first. Dates are Pacific time (PT); details 
 
 - **WAL payload GC stalls:** `Manifest::pruned_through` now tracks reclaimed WAL progress so GC reads and deletes only `(pruned_through, through]` with 32-way concurrency instead of scanning serially from sequence 1 on every pass, which previously stalled indexing for 30–230 s per pass at 22M–25M rows.
 
-[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.79...HEAD
+[Unreleased]: https://github.com/endgame-labs/blowfish/compare/v0.1.80...HEAD
+[0.1.80]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.80
 [0.1.79]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.79
 [0.1.78]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.78
 [0.1.77]: https://github.com/endgame-labs/blowfish/releases/tag/v0.1.77

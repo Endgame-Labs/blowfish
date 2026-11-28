@@ -3181,15 +3181,23 @@ impl SegmentReader {
     }
     async fn bitmap(&self, ids: &[u64]) -> io::Result<RoaringBitmap> {
         let metas = self.load(ids.iter().copied()).await?;
-        let blocks: Vec<_> = ids
-            .iter()
-            .flat_map(|id| metas[id].blocks.iter().map(|b| (b, metas[id].df)))
-            .collect();
-        let postings = try_join_all(blocks.iter().map(|(b, df)| self.postings(b, *df))).await?;
-        Ok(postings
-            .iter()
-            .flat_map(|p| p.iter().map(|(row, _)| *row))
-            .collect())
+        let mut out = RoaringBitmap::new();
+        for id in ids {
+            let meta = &metas[id];
+            let postings =
+                try_join_all(meta.blocks.iter().map(|b| self.postings(b, meta.df))).await?;
+            // One term's blocks ascend, so its rows arrive sorted: build them without per-row inserts.
+            let rows = RoaringBitmap::from_sorted_iter(
+                postings.iter().flat_map(|p| p.iter().map(|(row, _)| *row)),
+            )
+            .map_err(|_| invalid("posting rows out of order"))?;
+            if out.is_empty() {
+                out = rows;
+            } else {
+                out |= rows;
+            }
+        }
+        Ok(out)
     }
     async fn boolean_terms(&self, text: &str, prefix: bool) -> io::Result<Vec<u64>> {
         if !matches!(self.tokenizer, Tokenizer::WordV3 | Tokenizer::WordV4) {
@@ -3268,17 +3276,28 @@ impl SegmentReader {
     /// null fields. Boolean UAX #29 matching also recognizes punctuation-delimited
     /// subwords; it does not affect BM25 statistics or phrase positions.
     pub async fn contains_all_tokens(&self, query: &Query) -> io::Result<RoaringBitmap> {
-        let mut result: RoaringBitmap = (0..self.num_docs()).collect();
+        // The first token's rows start the intersection: building every row of the segment first
+        // costs about 5 ns a row.
+        let mut result: Option<RoaringBitmap> = None;
         for (i, token) in query.tokens.iter().enumerate() {
             let prefix = query.last_as_prefix && i + 1 == query.tokens.len();
-            result &= self
+            let rows = self
                 .bitmap(&self.boolean_terms(&token.text, prefix).await?)
                 .await?;
-            if result.is_empty() {
+            let rows = match result.take() {
+                Some(mut so_far) => {
+                    so_far &= rows;
+                    so_far
+                }
+                None => rows,
+            };
+            let empty = rows.is_empty();
+            result = Some(rows);
+            if empty {
                 break;
             }
         }
-        Ok(result)
+        Ok(result.unwrap_or_else(|| (0..self.num_docs()).collect()))
     }
     /// Rows containing at least one query token; empty queries match no rows.
     pub async fn contains_any_token(&self, query: &Query) -> io::Result<RoaringBitmap> {
@@ -3309,16 +3328,27 @@ impl SegmentReader {
                 "segment has no positions",
             ));
         }
-        let mut candidates: RoaringBitmap = (0..self.num_docs()).collect();
+        if query.tokens.is_empty() {
+            return Ok((0..self.num_docs()).collect());
+        }
+        let mut candidates: Option<RoaringBitmap> = None;
         for token in &query.tokens {
             let Some(id) = self.term(&token.text).await? else {
                 return Ok(RoaringBitmap::new());
             };
-            candidates &= self.bitmap(&[id]).await?;
+            let rows = self.bitmap(&[id]).await?;
+            candidates = Some(match candidates.take() {
+                Some(mut so_far) => {
+                    so_far &= rows;
+                    so_far
+                }
+                None => rows,
+            });
+            if candidates.as_ref().is_some_and(RoaringBitmap::is_empty) {
+                return Ok(RoaringBitmap::new());
+            }
         }
-        if query.tokens.is_empty() || candidates.is_empty() {
-            return Ok(candidates);
-        }
+        let candidates = candidates.expect("a non-empty query has a first token");
         let mut terms: BTreeMap<String, BTreeMap<u32, Vec<(u32, u32)>>> = BTreeMap::new();
         for term in query.exact_terms().keys() {
             let id = self.term(term).await?.unwrap();
