@@ -68,6 +68,49 @@ fn record<T>(op: &'static str, start: Instant, result: &Result<T>, bytes: u64) {
         metrics::counter!("blowfish_object_store_bytes_total", "op" => op).increment(bytes);
     }
 }
+/// Record a `head` that a local store answered with a `stat` on the calling thread (see
+/// [`Storage::head`](crate::Storage::head)): the series the object-store wrapper writes for every
+/// other `head`, with their handles resolved once.
+pub(crate) fn record_inline_head<T>(start: Instant, result: &std::result::Result<T, crate::Error>) {
+    use std::sync::OnceLock;
+    struct Handles {
+        attempts: metrics::Counter,
+        seconds: metrics::Histogram,
+        ok: OnceLock<(metrics::Counter, metrics::Counter)>,
+        not_found: OnceLock<metrics::Counter>,
+        error: OnceLock<metrics::Counter>,
+    }
+    static HANDLES: OnceLock<Handles> = OnceLock::new();
+    let h = HANDLES.get_or_init(|| Handles {
+        attempts: metrics::counter!("blowfish_object_store_attempts_total", "op" => "head"),
+        seconds: metrics::histogram!("blowfish_object_store_request_seconds", "op" => "head"),
+        ok: OnceLock::new(),
+        not_found: OnceLock::new(),
+        error: OnceLock::new(),
+    });
+    let elapsed = start.elapsed();
+    h.attempts.increment(1);
+    crate::diagnostics::record("head", 0, elapsed);
+    let requests = |status: &'static str| metrics::counter!("blowfish_object_store_requests_total", "op" => "head", "status" => status);
+    match result {
+        Ok(_) => {
+            let (requests, bytes) = h.ok.get_or_init(|| {
+                (
+                    requests("ok"),
+                    metrics::counter!("blowfish_object_store_bytes_total", "op" => "head"),
+                )
+            });
+            requests.increment(1);
+            bytes.increment(0);
+        }
+        Err(crate::Error::NotFound) => h
+            .not_found
+            .get_or_init(|| requests("not_found"))
+            .increment(1),
+        Err(_) => h.error.get_or_init(|| requests("error")).increment(1),
+    }
+    h.seconds.record(elapsed.as_secs_f64());
+}
 #[async_trait]
 impl ObjectStore for Observed {
     async fn put_opts(

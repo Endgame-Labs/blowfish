@@ -239,7 +239,12 @@ impl Engine {
             };
             merged
         };
-        metrics::counter!("blowfish_query_cpu_dispatch_total", "path" => "inline").increment(1);
+        static INLINE: std::sync::OnceLock<metrics::Counter> = std::sync::OnceLock::new();
+        INLINE
+            .get_or_init(
+                || metrics::counter!("blowfish_query_cpu_dispatch_total", "path" => "inline"),
+            )
+            .increment(1);
         warm_graph::Cache::observe(
             self,
             ns,

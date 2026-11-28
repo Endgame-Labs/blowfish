@@ -124,15 +124,18 @@ impl CacheStats {
             Tier::Miss => &self.misses,
         };
         counter.fetch_add(bytes, Ordering::Relaxed);
-        match tier {
-            Tier::Memory => {
-                metrics::counter!("blowfish_cache_hits_total", "tier" => "memory").increment(blocks)
-            }
-            Tier::Disk => {
-                metrics::counter!("blowfish_cache_hits_total", "tier" => "disk").increment(blocks)
-            }
-            Tier::Miss => metrics::counter!("blowfish_cache_misses_total").increment(blocks),
-        }
+        static HANDLES: [std::sync::OnceLock<metrics::Counter>; 3] =
+            [const { std::sync::OnceLock::new() }; 3];
+        let (cell, name, tier_label) = match tier {
+            Tier::Memory => (&HANDLES[0], "blowfish_cache_hits_total", Some("memory")),
+            Tier::Disk => (&HANDLES[1], "blowfish_cache_hits_total", Some("disk")),
+            Tier::Miss => (&HANDLES[2], "blowfish_cache_misses_total", None),
+        };
+        cell.get_or_init(|| match tier_label {
+            Some(label) => metrics::counter!(name, "tier" => label),
+            None => metrics::counter!(name),
+        })
+        .increment(blocks);
     }
 }
 impl CacheStatsSnapshot {

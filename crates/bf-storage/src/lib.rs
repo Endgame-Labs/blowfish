@@ -535,6 +535,17 @@ impl Storage {
     }
     /// Read object metadata without downloading the payload.
     pub async fn head(&self, key: &str) -> Result<ObjectInfo, Error> {
+        if let Some(mapped) = self.0.cache.mapped.get() {
+            let start = std::time::Instant::now();
+            let result = mapped.head(&self.path(key));
+            observed::record_inline_head(start, &result);
+            let (size, last_modified) = result?;
+            return Ok(ObjectInfo {
+                key: key.into(),
+                size,
+                last_modified,
+            });
+        }
         let m = self.0.backend.head(&self.path(key)).await?;
         Ok(ObjectInfo {
             key: key.into(),
