@@ -1859,6 +1859,72 @@ async fn filter_dictionary(
         None => Ok(None),
     }
 }
+/// Each row's group under `limit.per` for one scalar attribute: the dictionary's value index, with
+/// rows holding no value (missing or null) sharing one group, as the document path's `[null]` key.
+pub(crate) struct GroupCodes {
+    pub codes: Vec<u16>,
+    pub groups: usize,
+}
+/// The most distinct values a [`GroupCodes`] array distinguishes.
+const MAX_GROUPS: usize = u16::MAX as usize;
+/// [`GroupCodes`] of a filterable scalar attribute, built once per segment by inverting its filter
+/// dictionary and charged to the decoded cache. `None` when the attribute has no dictionary here, is
+/// not a plain scalar (an array puts a row under several values), has too many values, or a row
+/// appears under two.
+pub(crate) async fn group_codes(
+    store: &Storage,
+    segment: &Segment,
+    schema: &Schema,
+    attribute: &str,
+    rows: usize,
+) -> Result<Option<Arc<GroupCodes>>, ApiError> {
+    use bf_types::ScalarType::*;
+    let groupable = matches!(
+        schema.get(attribute).and_then(|s| s.data_type.as_ref()),
+        Some(AttributeType::Scalar(
+            String | Int | Uint | Bool | Uuid | Datetime
+        ))
+    );
+    let Some(file) = segment.files.get("filters") else {
+        return Ok(None);
+    };
+    if !groupable || attribute == "id" {
+        return Ok(None);
+    }
+    let key = format!("{}:{attribute}:group-codes", file.key);
+    if let Some(codes) = read_cache::get::<GroupCodes>(&key, rows as u64 * 2) {
+        return Ok(Some(codes));
+    }
+    let Some(values) = filter_dictionary(store, segment, attribute, true).await? else {
+        return Ok(None);
+    };
+    let null = values.iter().position(|(v, _)| v.is_null());
+    let groups = values.len() + usize::from(null.is_none());
+    if groups > MAX_GROUPS {
+        return Ok(None);
+    }
+    let missing = null.unwrap_or(values.len()) as u16;
+    let mut codes = vec![missing; rows];
+    let mut seen = RoaringBitmap::new();
+    for (code, (value, set)) in values.iter().enumerate() {
+        if value.is_null() {
+            continue;
+        }
+        if seen.intersection_len(set) != 0 || set.max().is_some_and(|m| m as usize >= rows) {
+            return Ok(None);
+        }
+        seen |= set;
+        for row in set {
+            codes[row as usize] = code as u16;
+        }
+    }
+    let bytes = rows as u64 * 2;
+    Ok(Some(read_cache::insert(
+        &key,
+        bytes,
+        GroupCodes { codes, groups },
+    )))
+}
 /// The largest values of a filterable attribute with their rows, for streams that list rows from the
 /// top. `values` keeps the dictionary's layout (a null entry first, then numbers ascending) but only
 /// the last `TOP_VALUES` numbers, so a large dictionary does not have to stay decoded in memory.

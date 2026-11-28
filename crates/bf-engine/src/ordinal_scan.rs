@@ -133,9 +133,17 @@ pub(crate) async fn select(
     let ids = segment::ids(store, seg).await?;
     crate::ann::stage(started, "ordinal ids");
     let per = q.limit.as_ref().and_then(Limit::per);
+    // One scalar group attribute with a filter dictionary groups by integer code (see
+    // `segment::group_codes`): no column is projected for it and no key is built.
+    let codes = match per {
+        Some(per) if per.attributes.len() == 1 => {
+            segment::group_codes(store, seg, &state.schema, &per.attributes[0], ids.len()).await?
+        }
+        _ => None,
+    };
     let mut columns = BTreeSet::new();
     attributes(rank, &mut columns);
-    if let Some(per) = per {
+    if let (Some(per), None) = (per, &codes) {
         columns.extend(per.attributes.iter().cloned());
     }
     columns.remove("id");
@@ -157,6 +165,8 @@ pub(crate) async fn select(
         .collect();
     let mut best: BinaryHeap<Contender> = BinaryHeap::new();
     let mut groups: HashMap<String, BinaryHeap<Contender>> = HashMap::new();
+    let mut coded: Vec<BinaryHeap<Contender>> = Vec::new();
+    coded.resize_with(codes.as_ref().map_or(0, |c| c.groups), Default::default);
     if crate::ann::trace_stages() {
         eprintln!("STAGE ordinal rows {} of {}", rows.len(), allowed.len());
     }
@@ -180,6 +190,7 @@ pub(crate) async fn select(
                 let key = (score > 0.0 || score.is_nan())
                     .then_some(per)
                     .flatten()
+                    .filter(|_| codes.is_none())
                     .map(|per| {
                         serde_json::to_string(
                             &per.attributes
@@ -201,15 +212,22 @@ pub(crate) async fn select(
                 id: &ids[row as usize],
                 row,
             };
-            match (per, key) {
-                (Some(per), Some(key)) => offer(groups.entry(key).or_default(), c, per.limit),
+            match (per, key, &codes) {
+                (Some(per), _, Some(codes)) => {
+                    offer(&mut coded[codes.codes[row as usize] as usize], c, per.limit)
+                }
+                (Some(per), Some(key), None) => offer(groups.entry(key).or_default(), c, per.limit),
                 _ => offer(&mut best, c, k),
             }
         }
     }
     crate::ann::stage(started, "ordinal total");
     let mut selected = RoaringBitmap::new();
-    for c in best.iter().chain(groups.values().flat_map(|h| h.iter())) {
+    for c in best
+        .iter()
+        .chain(groups.values().flat_map(|h| h.iter()))
+        .chain(coded.iter().flat_map(|h| h.iter()))
+    {
         selected.insert(c.row);
     }
     Ok(selected)
